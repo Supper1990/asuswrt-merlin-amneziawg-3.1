@@ -23,6 +23,7 @@ SCRIPT_NAME="amneziawg"
 RT_TABLE=300
 AWG_CHAIN="AWG"
 LOCKDIR="/tmp/.awg_lock"
+UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
 V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text"
 GEOIP_SERVICES="telegram google facebook twitter netflix cloudflare fastly cloudfront"
 
@@ -977,8 +978,14 @@ EOF
     local geo_downloaded=false
     geo_available && geo_downloaded=true
 
+    local package_version go_version tools_version
+    package_version=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2; exit}')
+    [ -z "$package_version" ] && package_version="$AWG_VERSION"
+    go_version=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $NF}')
+    tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $NF}')
+
     cat > "$STATUS_FILE" << STATUSEOF
-{"running":${running},"version":"${AWG_VERSION}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"log":"${log_text}"}
+{"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"log":"${log_text}"}
 STATUSEOF
 }
 
@@ -1102,22 +1109,34 @@ do_watchdog(){
 
 # --- Update check ---
 
+latest_upstream_tag(){
+    local repo="$1" prefix="$2"
+    curl -sfL --connect-timeout 10 --max-time 15 \
+        "https://api.github.com/repos/${repo}/tags?per_page=30" 2>/dev/null | \
+        grep '"name"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"//;s/".*//' | \
+        grep "^${prefix}" | head -1
+}
+
 check_update(){
-    local repo="r0otx/asuswrt-merlin-amneziawg"
-    local latest
-    latest=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
-    if [ -z "$latest" ]; then
-        echo "{\"current\":\"$AWG_VERSION\",\"latest\":\"\",\"update\":false,\"error\":\"Cannot reach GitHub\"}"
-        return
-    fi
+    local current latest installed_go installed_tools latest_go latest_tools
+    current=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2; exit}')
+    [ -z "$current" ] && current="$AWG_VERSION"
+    latest=$(curl -sfL --connect-timeout 10 --max-time 15 \
+        "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" 2>/dev/null | \
+        grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
+    installed_go=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $NF}')
+    installed_tools=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $NF}')
+    latest_go=$(latest_upstream_tag "amnezia-vpn/amneziawg-go" "v3.1.")
+    latest_tools=$(latest_upstream_tag "amnezia-vpn/amneziawg-tools" "v3.1.")
     local update=false
-    [ "$latest" != "$AWG_VERSION" ] && update=true
-    echo "{\"current\":\"$AWG_VERSION\",\"latest\":\"$latest\",\"update\":$update}"
+    [ -n "$latest" ] && [ "$latest" != "$current" ] && update=true
+    local error=""
+    [ -z "$latest_go" ] || [ -z "$latest_tools" ] && error="Cannot reach one or more GitHub repositories"
+    echo "{\"current\":\"$current\",\"latest\":\"$latest\",\"update\":$update,\"installed_go\":\"$installed_go\",\"latest_go\":\"$latest_go\",\"installed_tools\":\"$installed_tools\",\"latest_tools\":\"$latest_tools\",\"error\":\"$error\"}"
 }
 
 do_update(){
     log_msg "Updating AmneziaWG..."
-    local repo="r0otx/asuswrt-merlin-amneziawg"
     local pkg_arch
     pkg_arch=$(opkg print-architecture 2>/dev/null | awk '$1=="arch" && $2!="all" {print $2}' | head -1)
     if [ -z "$pkg_arch" ]; then
@@ -1130,8 +1149,9 @@ do_update(){
     fi
 
     local release_json
-    release_json=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)
-    local ipk_url
+    release_json=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" 2>/dev/null)
+    local ipk_url sums_url latest
+    latest=$(echo "$release_json" | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
     ipk_url=$(echo "$release_json" | grep '"browser_download_url"' | grep "$pkg_arch" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
     if [ -z "$ipk_url" ]; then
         local base_arch=$(echo "$pkg_arch" | sed 's/-.*//')
@@ -1141,18 +1161,49 @@ do_update(){
         log_msg "ERROR: No package found for $pkg_arch"
         return 1
     fi
+    sums_url=$(echo "$release_json" | grep '"browser_download_url"' | grep '/SHA256SUMS"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
+    if [ -z "$sums_url" ]; then
+        log_msg "ERROR: SHA256SUMS not found in release"
+        return 1
+    fi
 
     local tmp="/tmp/amneziawg_update.ipk"
+    local sums="/tmp/amneziawg_SHA256SUMS"
     if ! curl -sfL --connect-timeout 10 --max-time 120 "$ipk_url" -o "$tmp"; then
         log_msg "ERROR: Download failed"
         return 1
     fi
+    if ! curl -sfL --connect-timeout 10 --max-time 30 "$sums_url" -o "$sums"; then
+        rm -f "$tmp"
+        log_msg "ERROR: SHA256SUMS download failed"
+        return 1
+    fi
+    local expected actual package_name
+    package_name=$(basename "$ipk_url")
+    expected=$(awk -v f="$package_name" '$2==f || $2=="*"f {print $1; exit}' "$sums")
+    actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    rm -f "$sums"
+    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+        rm -f "$tmp"
+        log_msg "ERROR: Package SHA256 mismatch"
+        return 1
+    fi
+
+    local backup_dir="/opt/backup-amneziawg-before-${latest:-update}-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    cp -a "$SETTINGS" "$backup_dir/" 2>/dev/null || true
+    cp -a "$CONF" "$AWG_DIR/awg0.addr" "$CLIENTS_FILE" "$backup_dir/" 2>/dev/null || true
+    log_msg "Backup saved: $backup_dir"
 
     do_stop 2>/dev/null
     wait_for_pid_exit amneziawg-go 10
     # Block auto-start during opkg install (S99amneziawg is triggered by opkg)
     touch /tmp/.awg_no_autostart
-    opkg install "$tmp" || opkg install --force-architecture "$tmp"
+    if ! /opt/bin/opkg install "$tmp" && ! /opt/bin/opkg install --force-architecture "$tmp"; then
+        rm -f "$tmp" /tmp/.awg_no_autostart
+        log_msg "ERROR: Package installation failed"
+        return 1
+    fi
     rm -f "$tmp"
     # Stop VPN if opkg's init script started it
     do_stop 2>/dev/null

@@ -173,6 +173,24 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.arm32 --output=output .
 - `output/amneziawg_*_armv7-2.6.ipk` -- ARM32 старые роутеры (RT-AC68U, RT-AC66U)
 - `output/amneziawg_*_armv7-3.2.ipk` -- ARM32 новые HND-роутеры (RT-AX56U, RT-AX58U)
 
+## Автономная сборка на VPS
+
+Каталог `server/` содержит сборщик без GitHub Actions. Скрипт ежедневно проверяет
+официальные теги `amneziawg-go` и `amneziawg-tools`, собирает ARM64-пакет через
+Docker, сохраняет локальную копию в `/opt/awg-merlin-releases` и публикует `.ipk`
+вместе с `SHA256SUMS` в GitHub Releases. Роутер показывает установленные и
+доступные версии в веб-интерфейсе и проверяет SHA-256 перед установкой.
+
+Сборка вручную:
+
+```shell
+cd /opt/awg-merlin-builder
+./server/awg-merlin-builder.sh --force
+```
+
+Периодическая проверка выполняется юнитами `awg-merlin-builder.service` и
+`awg-merlin-builder.timer`.
+
 ## Управление через CLI
 
 ```shell

@@ -126,41 +126,72 @@ function initial(){
 }
 
 function checkForUpdate(){
-    // Check GitHub directly from browser (no backend needed)
+    loadUpdateResult(false);
+}
+
+function requestUpdateCheck(){
+    var btn = document.getElementById('btn_check_updates');
+    var status = document.getElementById('awg_update_status');
+    if(btn){ btn.disabled = true; btn.value = 'Checking...'; }
+    if(status) status.textContent = 'Contacting GitHub...';
+    document.form.action_script.value = "start_awgcheckupdate";
+    document.form.submit();
+    setTimeout(function(){ loadUpdateResult(true); }, 4000);
+}
+
+function loadUpdateResult(showErrors){
     var xhr = new XMLHttpRequest();
-    xhr.open('GET', 'https://api.github.com/repos/r0otx/asuswrt-merlin-amneziawg/releases/latest', true);
-    xhr.timeout = 10000;
+    xhr.open('GET', '/user/awg_update.htm?_=' + Date.now(), true);
+    xhr.timeout = 5000;
     xhr.onload = function(){
+        var btn = document.getElementById('btn_check_updates');
+        if(btn){ btn.disabled = false; btn.value = 'Check Updates'; }
         if(xhr.status !== 200) return;
         try {
             var data = JSON.parse(xhr.responseText);
-            var latest = (data.tag_name || '').replace(/^v/, '');
-            showVersionInfo('', latest, false);
+            showVersionInfo(data);
         } catch(e){}
+    };
+    xhr.onerror = function(){
+        var btn = document.getElementById('btn_check_updates');
+        if(btn){ btn.disabled = false; btn.value = 'Check Updates'; }
+        if(showErrors){
+            var status = document.getElementById('awg_update_status');
+            if(status) status.textContent = 'Update check failed';
+        }
     };
     xhr.send();
 }
 
-function showVersionInfo(currentIgnored, latest, hasUpdateIgnored){
-    // Get current version from status file
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
-    xhr.timeout = 3000;
-    xhr.onload = function(){
-        try {
-            var s = JSON.parse(xhr.responseText);
-            var current = s.version || '';
-            var vi = document.getElementById('awg_version_info');
-            var ub = document.getElementById('awg_update_btn');
-            if(!vi) return;
-            if(current) vi.textContent = 'v' + current;
-            if(latest && current && latest !== current){
-                ub.style.display = 'inline';
-                ub.innerHTML = '<input type="button" class="button_gen" value="Update to v' + escHtml(latest) + '" onclick="doUpdate();" style="font-size:11px; padding:2px 10px;">';
-            }
-        } catch(e){}
+function showVersionInfo(data){
+    var setText = function(id, value){
+        var el = document.getElementById(id);
+        if(el) el.textContent = value || '-';
     };
-    xhr.send();
+    setText('awg_addon_latest', data.latest || 'No published release');
+    setText('awg_go_latest', data.latest_go);
+    setText('awg_tools_latest', data.latest_tools);
+
+    var status = document.getElementById('awg_update_status');
+    var coreUpdate = (data.latest_go && data.installed_go !== data.latest_go) ||
+                     (data.latest_tools && data.installed_tools !== data.latest_tools);
+    if(status){
+        if(data.error) status.textContent = data.error;
+        else if(data.update) status.textContent = 'Addon update available';
+        else if(coreUpdate) status.textContent = 'New AmneziaWG core available; VPS build required';
+        else status.textContent = 'Up to date';
+    }
+
+    var ub = document.getElementById('awg_update_btn');
+    if(ub){
+        if(data.update && data.latest){
+            ub.style.display = 'inline';
+            ub.innerHTML = '<input type="button" class="button_gen" value="Install v' + escHtml(data.latest) + '" onclick="doUpdate();" style="font-size:11px; padding:2px 10px;">';
+        } else {
+            ub.style.display = 'none';
+            ub.innerHTML = '';
+        }
+    }
 }
 
 function doUpdate(){
@@ -588,6 +619,15 @@ function updateStatusUI(s){
     var info = document.getElementById('awg_info');
     var peers = document.getElementById('awg_peers');
     var logbox = document.getElementById('awg_log');
+    var packageVersion = s.package_version || s.version || '';
+    var vi = document.getElementById('awg_version_info');
+    if(vi && packageVersion) vi.textContent = 'v' + packageVersion;
+    var addonInstalled = document.getElementById('awg_addon_installed');
+    var goInstalled = document.getElementById('awg_go_installed');
+    var toolsInstalled = document.getElementById('awg_tools_installed');
+    if(addonInstalled) addonInstalled.textContent = packageVersion || '-';
+    if(goInstalled) goInstalled.textContent = s.go_version || '-';
+    if(toolsInstalled) toolsInstalled.textContent = s.tools_version || '-';
 
     if(s.running){
         badge.className = 'awg-status running';
@@ -925,6 +965,20 @@ function initAutocompleteIp(){
                 <tr>
                     <th width="20%">Interface</th>
                     <td><span id="awg_info">-</span></td>
+                </tr>
+                <tr>
+                    <th width="20%">Versions</th>
+                    <td>
+                        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                            <tr><td style="width:30%;">Merlin Addon</td><td>Installed: <span id="awg_addon_installed">-</span></td><td>Published: <span id="awg_addon_latest">-</span></td></tr>
+                            <tr><td>amneziawg-go</td><td>Installed: <span id="awg_go_installed">-</span></td><td>Official: <span id="awg_go_latest">-</span></td></tr>
+                            <tr><td>amneziawg-tools</td><td>Installed: <span id="awg_tools_installed">-</span></td><td>Official: <span id="awg_tools_latest">-</span></td></tr>
+                        </table>
+                        <div style="margin-top:6px;">
+                            <input type="button" class="button_gen" id="btn_check_updates" value="Check Updates" onclick="requestUpdateCheck();">
+                            <span id="awg_update_status" style="margin-left:8px; font-size:11px;"></span>
+                        </div>
+                    </td>
                 </tr>
                 </table>
 

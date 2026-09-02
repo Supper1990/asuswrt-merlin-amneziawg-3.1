@@ -1,0 +1,12 @@
+[Unit]
+Description=Build and publish AmneziaWG package for Asuswrt-Merlin
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/awg-merlin-builder
+ExecStart=/opt/awg-merlin-builder/server/awg-merlin-builder.sh
+Nice=10
+IOSchedulingClass=idle
+

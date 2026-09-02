@@ -2,15 +2,6 @@ name: Build AWG 3.1 ARM64 package
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - build.sh
-      - build-ipk.sh
-      - addon/**
-      - awg0.conf.example
-      - .github/workflows/build-arm64.yml
 
 jobs:
   build:

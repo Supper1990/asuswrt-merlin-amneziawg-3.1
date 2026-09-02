@@ -171,6 +171,24 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.arm32 --output=output .
 
 Output: `output/amneziawg_1.0.0-1_aarch64-3.10.ipk`
 
+## Standalone VPS builder
+
+The `server/` directory contains a builder that does not use GitHub Actions. It
+checks the official `amneziawg-go` and `amneziawg-tools` tags, builds the ARM64
+package with Docker, keeps a local copy under `/opt/awg-merlin-releases`, and
+publishes the `.ipk` plus `SHA256SUMS` to GitHub Releases. The router UI displays
+installed and available versions and verifies SHA-256 before installation.
+
+Manual build:
+
+```shell
+cd /opt/awg-merlin-builder
+./server/awg-merlin-builder.sh --force
+```
+
+Periodic checks use `awg-merlin-builder.service` and
+`awg-merlin-builder.timer`.
+
 ## CLI usage
 
 ```shell
