@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PKG_NAME="amneziawg"
-PKG_VERSION="1.2.0-1"
+PKG_VERSION="1.2.0-2"
 
 if command -v gtar >/dev/null 2>&1; then
     TAR_BIN=gtar

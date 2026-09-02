@@ -6,14 +6,14 @@ ARG AWG_TOOLS_TAG=v3.1.20260812
 
 FROM golang:1.25-bookworm AS go-builder
 ARG AWG_GO_TAG
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates make \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 RUN git clone --depth 1 --branch "${AWG_GO_TAG}" \
     https://github.com/amnezia-vpn/amneziawg-go.git
 RUN cd amneziawg-go \
-    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-       go build -trimpath -ldflags="-s -w" -o /amneziawg-go .
+    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 make \
+    && cp amneziawg-go /amneziawg-go
 
 FROM debian:bookworm AS tools-builder
 ARG AWG_TOOLS_TAG
