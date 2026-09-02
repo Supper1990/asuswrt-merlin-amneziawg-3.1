@@ -10,7 +10,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-5"
+PKG_VERSION="2.2.0-6"
+
+AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
+AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
+[ -n "$AWG_GO_VERSION" ] || { echo "ERROR: AWG_GO_TAG not found"; exit 1; }
+[ -n "$AWG_TOOLS_VERSION" ] || { echo "ERROR: AWG_TOOLS_TAG not found"; exit 1; }
 
 if command -v gtar >/dev/null 2>&1; then
     TAR_BIN=gtar
@@ -123,6 +128,8 @@ PRERMEOF
 
     cp "$go_bin"                     "$DATA_DIR/opt/amneziawg/amneziawg-go"
     cp "$awg_bin"                    "$DATA_DIR/opt/amneziawg/awg"
+    printf '%s\n' "$AWG_GO_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-go.version"
+    printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
     cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
     cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 

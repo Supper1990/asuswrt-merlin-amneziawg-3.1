@@ -981,8 +981,10 @@ EOF
     local package_version go_version tools_version
     package_version=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2; exit}')
     [ -z "$package_version" ] && package_version="$AWG_VERSION"
-    go_version=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $NF}')
-    tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $NF}')
+    go_version=$(cat /opt/amneziawg/amneziawg-go.version 2>/dev/null)
+    tools_version=$(cat /opt/amneziawg/amneziawg-tools.version 2>/dev/null)
+    [ -n "$go_version" ] || go_version=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $2}')
+    [ -n "$tools_version" ] || tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $2}')
 
     cat > "$STATUS_FILE" << STATUSEOF
 {"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"log":"${log_text}"}
@@ -1124,8 +1126,10 @@ check_update(){
     latest=$(curl -sfL --connect-timeout 10 --max-time 15 \
         "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" 2>/dev/null | \
         grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
-    installed_go=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $NF}')
-    installed_tools=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $NF}')
+    installed_go=$(cat /opt/amneziawg/amneziawg-go.version 2>/dev/null)
+    installed_tools=$(cat /opt/amneziawg/amneziawg-tools.version 2>/dev/null)
+    [ -n "$installed_go" ] || installed_go=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $2}')
+    [ -n "$installed_tools" ] || installed_tools=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $2}')
     latest_go=$(latest_upstream_tag "amnezia-vpn/amneziawg-go" "v3.1.")
     latest_tools=$(latest_upstream_tag "amnezia-vpn/amneziawg-tools" "v3.1.")
     local update=false
