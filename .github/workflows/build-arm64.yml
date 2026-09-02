@@ -1,0 +1,39 @@
+name: Build AWG 3.1 ARM64 package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - build.sh
+      - build-ipk.sh
+      - addon/**
+      - awg0.conf.example
+      - .github/workflows/build-arm64.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scripts
+        run: |
+          sh -n addon/amneziawg.sh
+          bash -n build.sh build-ipk.sh
+      - name: Build ARM64 binaries
+        run: ./build.sh
+      - name: Build Entware package
+        run: ./build-ipk.sh
+      - name: List checksums
+        run: sha256sum output/amneziawg-go output/awg output/amneziawg_*_aarch64-3.10.ipk
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-3.1-aarch64
+          path: |
+            output/amneziawg-go
+            output/awg
+            output/amneziawg_*_aarch64-3.10.ipk
