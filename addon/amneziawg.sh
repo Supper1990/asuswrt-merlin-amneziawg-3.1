@@ -1207,18 +1207,6 @@ do_service_event(){
         awgsaveconf)
             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(get_setting awg_privatekey)" ]; do sleep 1; _wt=$((_wt+1)); done
             generate_config
-            if ! geo_available; then
-                # Clear geo settings if databases not downloaded
-                local _cs_changed=false
-                for _gf in awg_geo_v2fly awg_geo_v2fly_ip awg_geo_custom_domains awg_geo_custom_ips; do
-                    local _gv=$(get_setting "$_gf")
-                    if [ -n "$_gv" ]; then
-                        sed -i "/^${_gf} /d" "$SETTINGS"
-                        _cs_changed=true
-                    fi
-                done
-                [ "$_cs_changed" = true ] && log_msg "WARNING: Geo fields cleared — databases not downloaded. Click Download Lists first."
-            fi
             update_geo_if_needed
             is_running && setup_firewall
             update_status
