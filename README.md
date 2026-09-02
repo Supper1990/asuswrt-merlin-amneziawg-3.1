@@ -1,272 +1,205 @@
 # AmneziaWG for Asuswrt-Merlin
 
-![2026-03-25 12 34 03](https://github.com/user-attachments/assets/0ecdf3bc-f58e-4628-8a92-5f2af5cbd2ce)
+[[Русский]](README.md) · [[English]](README_EN.md)
 
+Клиент **AmneziaWG** с веб-интерфейсом для роутеров ASUS на прошивке **Asuswrt-Merlin**.
 
-[[русский]](README.md) [[english]](README_EN.md)
-
-VPN-клиент с обходом DPI-блокировок на базе [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-go) с веб-интерфейсом для роутеров ASUS на прошивке [Asuswrt-Merlin](https://www.asuswrt-merlin.net/). Маршрутизация по устройствам и выборочная маршрутизация через GeoIP/GeoSite.
-
-Полностью userspace-реализация -- не требует kernel module, работает на любой версии ядра.
-
-<details>
-    <summary>Поддерживаемые устройства</summary>
-
-Все роутеры aarch64 (ARM64) с Asuswrt-Merlin (`384.15` и новее, `3006.x`) и установленным Entware:
-
-- GT-AX11000
-- GT-AXE11000
-- GT-AX6000
-- RT-AX86U
-- RT-AX86U Pro
-- RT-AX88U
-- RT-AX88U Pro
-- RT-AX58U
-- RT-AX56U
-- TUF-AX5400
-
-Другие aarch64 роутеры с Merlin тоже должны работать.
-
-</details>
-
-<img width="768" height="817" alt="AmneziaWG" src="https://github.com/user-attachments/assets/12297a4f-938b-40c8-88a6-b3219940007e" />
-
+Проект предоставляет userspace-реализацию AmneziaWG с поддержкой импорта конфигураций, маршрутизации по устройствам, GeoIP/GeoSite и пользовательских правил.
 
 ## Возможности
 
-- **Протокол AmneziaWG 2.0/3.0/3.1** -- включая HeaderProtectionKey, ContentPaddingAddition, настраиваемые тайминги, RandomTrailers и DisableCookies
-- **Userspace-демон** -- на базе [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), без kernel module
-- **Веб-интерфейс** -- страница-аддон в стиле ROG, встроенная в панель роутера (VPN > AmneziaWG)
-- **Импорт конфига** -- загрузка `.conf` файла из клиента Amnezia VPN
-- **Маршрутизация по устройствам** -- политика VPN для каждого устройства: `VPN All`, `VPN Geo`, `Direct`
-- **GeoIP по сервисам** -- IP-диапазоны Telegram, Google, Netflix, Twitter и др. через [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)
-- **GeoSite по доменам** -- списки доменов через [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) + dnsmasq ipset
-- **Свои домены и IP** -- ручное добавление доменов и CIDR-подсетей
-- **Перехват DNS** -- принудительный DNS через dnsmasq, блокировка DoH/DoT для надёжной гео-маршрутизации
-- **MSS clamping** -- автоматическое исправление TCP MSS для туннельного трафика
-- **Автообновление** -- ежедневное обновление гео-списков по cron
+- **AmneziaWG 2.x и 3.1** — поддержка актуальных конфигураций AmneziaWG
+- **Userspace-реализация** — на базе `amneziawg-go`, без необходимости установки отдельного kernel module
+- **Веб-интерфейс** — управление AmneziaWG непосредственно из интерфейса Asuswrt-Merlin
+- **Импорт конфигурации** — загрузка готового `.conf`
+- **Маршрутизация по устройствам** — отдельные правила для устройств локальной сети
+- **Полная маршрутизация** — весь трафик выбранного устройства через AmneziaWG
+- **Выборочная маршрутизация** — направление через AmneziaWG только выбранного трафика
+- **Прямое подключение** — возможность исключить устройство из маршрутизации через AmneziaWG
+- **GeoIP** — маршрутизация по IP-адресам и CIDR-подсетям
+- **GeoSite** — маршрутизация по доменным спискам
+- **Custom Domains** — собственные доменные правила
+- **Custom IPs** — собственные IP-адреса и CIDR-подсети
+- **DNS-маршрутизация** — интеграция с `dnsmasq` и `ipset`
+- **MSS clamping**
+- **Обновление GeoIP/GeoSite-списков**
+- **Автоматическая проверка обновлений AmneziaWG**
+- **Установка обновлений из веб-интерфейса**
+- **Сохранение пользовательских настроек и конфигурации при штатном обновлении**
 
 ## Требования
 
-- [Прошивка Asuswrt-Merlin](https://www.asuswrt-merlin.net/download) (`384.15` и новее, `3006.x`)
-- Установленный [Entware](https://github.com/Entware/Entware/wiki/Install-on-Asus-stock-firmware) (ставится через [amtm](https://diversion.ch/amtm.html))
+- совместимый роутер ASUS
+- прошивка Asuswrt-Merlin
+- установленный Entware
 - SSH-доступ к роутеру
-- AmneziaWG-сервер (self-hosted) -- для быстрой установки сервера: [amneziawg-installer](https://github.com/bivlked/amneziawg-installer)
+- готовая конфигурация AmneziaWG
 
 ## Установка
 
-### Быстрая установка (одна команда)
+Скачайте подходящий `.ipk` пакет из раздела **Releases**.
 
-```shell
-curl -sfL https://raw.githubusercontent.com/r0otx/asuswrt-merlin-amneziawg/main/install-online.sh | sh
+Необходимо использовать пакет, соответствующий архитектуре вашего роутера.
+
+### 1. Скопируйте пакет на роутер
+
+```sh
+scp amneziawg_*.ipk admin@<IP-РОУТЕРА>:/tmp/
 ```
 
-Скрипт автоматически определит архитектуру роутера, скачает нужный пакет из последнего релиза и установит.
+### 2. Подключитесь к роутеру по SSH
 
-### Из .ipk пакета
-
-Скопируйте пакет на роутер и установите:
-
-```shell
-scp amneziawg_1.0.0-1_aarch64-3.10.ipk admin@<ip-роутера>:/tmp/
+```sh
+ssh admin@<IP-РОУТЕРА>
 ```
 
-```shell
-ssh admin@<ip-роутера>
-opkg install /tmp/amneziawg_1.0.0-1_aarch64-3.10.ipk
+### 3. Установите пакет
+
+```sh
+opkg install /tmp/amneziawg_*.ipk
 ```
 
-### Ручная установка
+### 4. Откройте веб-интерфейс
 
-```shell
-scp output/amneziawg-go output/awg admin@<ip-роутера>:/tmp/
-scp addon/amneziawg.sh addon/amneziawg_page.asp admin@<ip-роутера>:/tmp/
-scp install.sh admin@<ip-роутера>:/tmp/
-ssh admin@<ip-роутера>
-sh /tmp/install.sh
+После установки:
+
+1. Выйдите и снова войдите в веб-интерфейс Asuswrt-Merlin.
+2. Откройте страницу **AmneziaWG**.
+3. Импортируйте конфигурацию `.conf`.
+4. Проверьте импортированные параметры.
+5. Нажмите **Apply**.
+6. Запустите AmneziaWG.
+7. При необходимости настройте правила маршрутизации для устройств.
+
+## Маршрутизация
+
+Для каждого устройства локальной сети можно определить собственный режим работы.
+
+### Весь трафик
+
+Весь трафик выбранного устройства направляется через AmneziaWG.
+
+### Выборочная маршрутизация
+
+Через AmneziaWG направляется только трафик, соответствующий выбранным GeoIP, GeoSite и пользовательским правилам.
+
+### Прямое подключение
+
+Трафик выбранного устройства направляется напрямую.
+
+## GeoIP
+
+GeoIP позволяет задавать маршрутизацию по IP-адресам и CIDR-подсетям.
+
+Можно использовать готовые списки, а также добавлять собственные адреса и сети через **Custom IPs**.
+
+Пример:
+
+```text
+8.8.8.8
+1.1.1.0/24
 ```
 
-### После установки
+## GeoSite
 
-1. Выйдите и войдите заново в веб-интерфейс роутера
-2. Перейдите в **VPN > AmneziaWG**
-3. Нажмите **Import Config** и загрузите `.conf` файл из клиента Amnezia VPN
-4. Нажмите **Apply**
+GeoSite позволяет задавать маршрутизацию по доменным спискам.
 
-## Использование
+Для обработки доменных правил используется интеграция с `dnsmasq` и `ipset`.
 
-### Быстрый старт
+Для корректной работы доменной маршрутизации клиентские устройства должны использовать DNS-сервер роутера.
 
-1. Экспортируйте конфиг из клиента Amnezia VPN (файл `.conf`)
-2. В интерфейсе роутера: **VPN > AmneziaWG > Import Config** -- загрузите файл
-3. Нажмите **Apply** -- туннель запустится автоматически
-4. Добавьте устройства в разделе **Device Rules** с нужной политикой
+## Custom Domains
 
-### Политики маршрутизации
+В **Custom Domains** можно добавить собственные доменные имена.
 
-| Политика | Описание |
-|----------|----------|
-| **VPN All** | Весь трафик устройства через VPN |
-| **VPN Geo** | Только трафик к GeoIP/GeoSite-адресам через VPN |
-| **Direct** | Устройство обходит VPN |
+Пример:
 
-### GeoIP Service Lists
-
-Введите имена сервисов через запятую для маршрутизации их IP-диапазонов через VPN:
-
-```
-telegram,google,facebook,twitter,netflix,cloudflare
+```text
+example.com
+example.org
 ```
 
-Работают по IP -- не зависят от DNS, идеальны для Telegram и других приложений, которые подключаются напрямую по IP.
+## Custom IPs
 
-### GeoSite Service Lists
+В **Custom IPs** можно добавить отдельные IP-адреса или CIDR-подсети.
 
-Введите имена сервисов для маршрутизации по доменам через dnsmasq:
+Пример:
 
-```
-youtube,google,discord,netflix,spotify,instagram
-```
-
-Требует чтобы устройства использовали роутер как DNS-сервер. Для iPhone: **Настройки > Wi-Fi > (i) > DNS > Вручную > только IP роутера**.
-
-### Свои записи
-
-- **Custom Domains** -- домены через запятую (например `example.com,service.org`)
-- **Custom IPs** -- IP/CIDR через запятую (например `8.8.8.8,1.1.1.0/24`)
-
-## Сборка из исходников
-
-### Необходимо
-
-- Docker Desktop
-- GNU tar (`brew install gnu-tar` на macOS)
-
-### Сборка ARM64 binaries (через Docker)
-
-```shell
-# Собирает зафиксированные совместимые версии amneziawg-go и awg CLI
-./build.sh
-./build-ipk.sh
+```text
+8.8.8.8
+1.1.1.0/24
 ```
 
-Версии upstream можно переопределить явно:
+## Обновление
 
-```shell
-AWG_GO_TAG=v3.1.20260828 AWG_TOOLS_TAG=v3.1.20260812 ./build.sh
-```
+AmneziaWG автоматически проверяет наличие новой версии.
 
-### Сборка ARM32
+Если доступно обновление, информация о нём отображается в веб-интерфейсе.
 
-```shell
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.arm32 --output=output .
-```
+Обновление можно установить непосредственно из веб-интерфейса AmneziaWG.
 
-### Сборка .ipk пакетов
+При штатном обновлении пользовательские настройки и конфигурация сохраняются.
 
-```shell
-./build-ipk.sh
-```
+## Управление через SSH
 
-Результат:
-- `output/amneziawg_*_aarch64-3.10.ipk` -- ARM64 роутеры (GT-AX11000, RT-AX86U, RT-AX88U)
-- `output/amneziawg_*_armv7-2.6.ipk` -- ARM32 старые роутеры (RT-AC68U, RT-AC66U)
-- `output/amneziawg_*_armv7-3.2.ipk` -- ARM32 новые HND-роутеры (RT-AX56U, RT-AX58U)
+### Запуск
 
-## Автономная сборка на VPS
-
-Каталог `server/` содержит сборщик без GitHub Actions. Скрипт ежедневно проверяет
-официальные теги `amneziawg-go` и `amneziawg-tools`, собирает ARM64-пакет через
-Docker, сохраняет локальную копию в `/opt/awg-merlin-releases` и публикует `.ipk`
-вместе с `SHA256SUMS` в GitHub Releases. Роутер показывает установленные и
-доступные версии в веб-интерфейсе и проверяет SHA-256 перед установкой.
-
-Сборка вручную:
-
-```shell
-cd /opt/awg-merlin-builder
-./server/awg-merlin-builder.sh --force
-```
-
-Периодическая проверка выполняется юнитами `awg-merlin-builder.service` и
-`awg-merlin-builder.timer`.
-
-## Управление через CLI
-
-```shell
-# Запуск/остановка/перезапуск
+```sh
 /opt/etc/init.d/S99amneziawg start
+```
+
+### Остановка
+
+```sh
 /opt/etc/init.d/S99amneziawg stop
+```
+
+### Перезапуск
+
+```sh
 /opt/etc/init.d/S99amneziawg restart
+```
 
-# Статус туннеля
+### Состояние AmneziaWG
+
+```sh
 awg show
-
-# Обновить гео-списки
-/jffs/addons/amneziawg/amneziawg.sh update_geo
 ```
 
 ## Удаление
 
-```shell
+Для удаления AmneziaWG:
+
+```sh
 /jffs/addons/amneziawg/amneziawg.sh uninstall
 opkg remove amneziawg
 ```
 
-## Архитектура
-
-```
-Интернет <-- awg0 (туннель) <-- iptables mangle цепочка AWG <-- br0 (устройства LAN)
-                                          |
-                                  ipset awg_dst (GeoIP CIDR + DNS-резолвы)
-                                          |
-                                  fwmark 0x100 -> таблица маршрутов 300 -> awg0
-```
+## Основные компоненты
 
 | Компонент | Назначение |
-|-----------|-----------|
-| **amneziawg-go** | Userspace WireGuard-демон с расширениями AmneziaWG |
-| **awg** | CLI-утилита для управления туннелем |
-| **amneziawg.sh** | Backend: жизненный цикл, firewall, маршрутизация, гео-списки, перехват DNS |
-| **amneziawg_page.asp** | Веб-интерфейс (аддон для Merlin) |
-
-## FAQ
-
-**В: Telegram не работает через VPN?**
-
-О: Добавьте `telegram` в GeoIP Service Lists. Telegram подключается по IP напрямую -- доменных списков недостаточно.
-
-**В: Сайты не открываются на iPhone с политикой VPN Geo?**
-
-О: iPhone использует зашифрованный DNS (DoH), который обходит dnsmasq роутера. Настройте DNS вручную: Настройки > Wi-Fi > (i) > DNS > Вручную > только IP роутера.
-
-**В: Туннель работает для ping, но сайты не открываются?**
-
-О: Перезапустите туннель с паузой: `/jffs/addons/amneziawg/amneziawg.sh stop; sleep 5; /jffs/addons/amneziawg/amneziawg.sh start`
-
-**В: Как добавить свой сервис по IP?**
-
-О: Добавьте CIDR-диапазоны в поле Custom IPs, например `149.154.160.0/20,91.108.4.0/22` для Telegram.
-
-**В: Поддерживается ли ARM32 (RT-AC68U)?**
-
-О: Да, есть отдельный .ipk для ARM32 (`armv7-2.6`).
-
-## Автор
-
-**r0otx** -- [github.com/r0otx](https://github.com/r0otx)
+|---|---|
+| `amneziawg-go` | Userspace-реализация AmneziaWG |
+| `awg` | CLI для управления интерфейсом AmneziaWG |
+| `amneziawg.sh` | Управление AmneziaWG, маршрутизацией и сетевыми правилами |
+| `amneziawg_page.asp` | Веб-интерфейс для Asuswrt-Merlin |
 
 ## Благодарности
 
-- [AmneziaWG](https://github.com/amnezia-vpn) -- протокол и реализации
-- [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) -- GeoIP CIDR-списки сервисов
-- [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) -- доменные списки
-- [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) -- прошивка роутера
-- [DanielLavrushin/asuswrt-merlin-xrayui](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui) -- референс архитектуры маршрутизации
+- AmneziaWG — протокол и реализации
+- [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) — прошивка роутера
+- [Entware](https://github.com/Entware/Entware) — пакетная система
+- [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) — GeoIP-списки
+- [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) — доменные списки
+- [DanielLavrushin/asuswrt-merlin-xrayui](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui) — архитектурный референс
 
-## Дисклеймер
+## Правовая информация
 
-Данный проект является техническим инструментом для обеспечения сетевой безопасности и приватности. Использование VPN в Российской Федерации не запрещено (по состоянию на март 2026). Автор не несёт ответственности за использование ПО в целях, противоречащих законодательству РФ или иных юрисдикций. Пользователь самостоятельно несёт ответственность за соблюдение применимого законодательства.
+Программное обеспечение предоставляется исключительно в технических и исследовательских целях.
+
+Пользователь самостоятельно несёт ответственность за соблюдение законодательства страны, в которой используется программное обеспечение.
+
+Автор проекта не несёт ответственности за использование программного обеспечения с нарушением применимого законодательства.
 
 ## Лицензия
 
