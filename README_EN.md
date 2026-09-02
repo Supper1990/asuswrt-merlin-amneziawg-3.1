@@ -1,266 +1,205 @@
 # AmneziaWG for Asuswrt-Merlin
 
-[[русский]](README.md) [[english]](README_EN.md)
+[[Русский]](README.md) · [[English]](README_EN.md)
 
-DPI-obfuscated WireGuard VPN client with web UI for ASUS routers running [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) firmware. Provides per-device policy routing and GeoIP/GeoSite selective routing using [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-go) protocol.
+**AmneziaWG** client with a web interface for ASUS routers running **Asuswrt-Merlin**.
 
-Fully userspace implementation -- no kernel module required, works on any kernel version.
-
-<details>
-    <summary>Supported devices</summary>
-
-All aarch64 (ARM64) routers running Asuswrt-Merlin (`384.15` or later, `3006.x`) with Entware installed:
-
-- GT-AX11000
-- GT-AXE11000
-- GT-AX6000
-- RT-AX86U
-- RT-AX86U Pro
-- RT-AX88U
-- RT-AX88U Pro
-- RT-AX58U
-- RT-AX56U
-- TUF-AX5400
-
-Other aarch64 Merlin routers should also work.
-
-</details>
+The project provides a userspace implementation of AmneziaWG with configuration import, per-device routing, GeoIP/GeoSite support, and custom rules.
 
 ## Features
 
-- **AmneziaWG 2.0/3.0/3.1 protocol** -- including HeaderProtectionKey, ContentPaddingAddition, configurable timings, RandomTrailers, and DisableCookies
-- **Userspace daemon** -- based on [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go), no kernel module needed
-- **Web UI** -- ROG-styled addon page integrated into router admin panel (VPN > AmneziaWG)
-- **Config import** -- upload `.conf` file exported from Amnezia VPN client
-- **Per-device routing** -- assign VPN policy per device: `VPN All`, `VPN Geo`, `Direct`
-- **GeoIP service routing** -- IP ranges for Telegram, Google, Netflix, Twitter, etc. via [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)
-- **GeoSite domain routing** -- domain lists via [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) + dnsmasq ipset
-- **Custom domains & IPs** -- manual domain and CIDR entries
-- **DNS interception** -- forces DNS through dnsmasq, blocks DoH/DoT for reliable geo routing
-- **MSS clamping** -- automatic TCP MSS fix for tunnel traffic
-- **Auto-update** -- daily cron for geo list refresh
+- **AmneziaWG 2.x and 3.1** — support for current AmneziaWG configurations
+- **Userspace implementation** — based on `amneziawg-go`, with no separate kernel module required
+- **Web interface** — manage AmneziaWG directly from the Asuswrt-Merlin interface
+- **Configuration import** — upload an existing `.conf` file
+- **Per-device routing** — individual rules for local network devices
+- **Full routing** — route all traffic from a selected device through AmneziaWG
+- **Selective routing** — route only selected traffic through AmneziaWG
+- **Direct connection** — exclude a device from routing through AmneziaWG
+- **GeoIP** — routing by IP addresses and CIDR networks
+- **GeoSite** — routing by domain lists
+- **Custom Domains** — custom domain rules
+- **Custom IPs** — custom IP addresses and CIDR networks
+- **DNS routing** — integration with `dnsmasq` and `ipset`
+- **MSS clamping**
+- **GeoIP/GeoSite list updates**
+- **Automatic AmneziaWG update checks**
+- **Install updates from the web interface**
+- **Preserve user settings and configuration during normal updates**
 
 ## Requirements
 
-- [Asuswrt-Merlin firmware](https://www.asuswrt-merlin.net/download) (`384.15` or later, `3006.x`)
-- [Entware](https://github.com/Entware/Entware/wiki/Install-on-Asus-stock-firmware) installed (use [amtm](https://diversion.ch/amtm.html) to install)
+- compatible ASUS router
+- Asuswrt-Merlin firmware
+- Entware installed
 - SSH access to the router
-- AmneziaWG server (self-hosted) -- for quick server setup: [amneziawg-installer](https://github.com/bivlked/amneziawg-installer)
+- an AmneziaWG configuration
 
 ## Installation
 
-### Quick install (one command)
+Download the appropriate `.ipk` package from **Releases**.
 
-```shell
-curl -sfL https://raw.githubusercontent.com/r0otx/asuswrt-merlin-amneziawg/main/install-online.sh | sh
+Use the package matching your router architecture.
+
+### 1. Copy the package to the router
+
+```sh
+scp amneziawg_*.ipk admin@<ROUTER-IP>:/tmp/
 ```
 
-The script auto-detects router architecture, downloads the latest package from GitHub releases and installs it.
+### 2. Connect to the router via SSH
 
-### From .ipk package
-
-Copy the package to the router and install:
-
-```shell
-scp amneziawg_1.0.0-1_aarch64-3.10.ipk admin@<router-ip>:/tmp/
+```sh
+ssh admin@<ROUTER-IP>
 ```
 
-```shell
-ssh admin@<router-ip>
-opkg install /tmp/amneziawg_1.0.0-1_aarch64-3.10.ipk
+### 3. Install the package
+
+```sh
+opkg install /tmp/amneziawg_*.ipk
 ```
 
-### Manual installation
+### 4. Open the web interface
 
-```shell
-scp output/amneziawg-go output/awg admin@<router-ip>:/tmp/
-scp addon/amneziawg.sh addon/amneziawg_page.asp admin@<router-ip>:/tmp/
-scp install.sh admin@<router-ip>:/tmp/
-ssh admin@<router-ip>
-sh /tmp/install.sh
+After installation:
+
+1. Log out of the Asuswrt-Merlin web interface and log back in.
+2. Open the **AmneziaWG** page.
+3. Import your `.conf` configuration.
+4. Check the imported parameters.
+5. Click **Apply**.
+6. Start AmneziaWG.
+7. Configure routing rules for devices if needed.
+
+## Routing
+
+Each local network device can use its own routing mode.
+
+### All traffic
+
+All traffic from the selected device is routed through AmneziaWG.
+
+### Selective routing
+
+Only traffic matching selected GeoIP, GeoSite, and custom rules is routed through AmneziaWG.
+
+### Direct connection
+
+Traffic from the selected device is routed directly.
+
+## GeoIP
+
+GeoIP provides routing by IP addresses and CIDR networks.
+
+You can use predefined lists and add your own addresses and networks through **Custom IPs**.
+
+Example:
+
+```text
+8.8.8.8
+1.1.1.0/24
 ```
 
-### Post-installation
+## GeoSite
 
-1. Log out and log back in to the router web UI
-2. Navigate to **VPN > AmneziaWG**
-3. Click **Import Config** and upload your `.conf` file from Amnezia VPN client
-4. Click **Apply**
+GeoSite provides routing by domain lists.
 
-## Usage
+Domain rules are processed using integration with `dnsmasq` and `ipset`.
 
-### Quick start
+For domain routing to work correctly, client devices must use the router as their DNS server.
 
-1. Export config from Amnezia VPN client (`.conf` file)
-2. In router UI: **VPN > AmneziaWG > Import Config** -- upload the file
-3. Click **Apply** -- tunnel starts automatically
-4. Add devices in **Device Rules** section with desired policy
+## Custom Domains
 
-### Routing policies
+Use **Custom Domains** to add your own domain names.
 
-| Policy | Description |
-|--------|-------------|
-| **VPN All** | All device traffic goes through VPN |
-| **VPN Geo** | Only traffic to GeoIP/GeoSite destinations goes through VPN |
-| **Direct** | Device bypasses VPN entirely |
+Example:
 
-### GeoIP Service Lists
-
-Add service names (comma-separated) to route their IP ranges through VPN:
-
-```
-telegram,google,facebook,twitter,netflix,cloudflare
+```text
+example.com
+example.org
 ```
 
-These are IP-based -- work without DNS, ideal for Telegram and other apps that connect by IP directly.
+## Custom IPs
 
-### GeoSite Service Lists
+Use **Custom IPs** to add individual IP addresses or CIDR networks.
 
-Add service names for domain-based routing via dnsmasq:
+Example:
 
-```
-youtube,google,discord,netflix,spotify,instagram
-```
-
-Requires devices to use the router as DNS server. For iPhones: **Settings > Wi-Fi > (i) > DNS > Manual > router IP only**.
-
-### Custom entries
-
-- **Custom Domains** -- comma-separated domains (e.g. `example.com,service.org`)
-- **Custom IPs** -- comma-separated IPs/CIDRs (e.g. `8.8.8.8,1.1.1.0/24`)
-
-## Building from source
-
-### Prerequisites
-
-- Docker Desktop
-- Go 1.24+ (for amneziawg-go)
-- GNU tar (`brew install gnu-tar` on macOS)
-
-### Build amneziawg-go (userspace daemon)
-
-```shell
-git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-go.git
-cd amneziawg-go
-
-# ARM64 (aarch64-3.10) — GT-AX11000, RT-AX86U, RT-AX88U
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o ../output/amneziawg-go
-
-# ARM32 (armv7-2.6) — RT-AC68U, RT-AC66U, older ARM routers
-CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 go build -ldflags="-s -w" -o ../output/amneziawg-go-arm5
-
-# ARM32 (armv7-3.2) — RT-AX56U, RT-AX58U, newer HND routers
-CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o ../output/amneziawg-go-arm
+```text
+8.8.8.8
+1.1.1.0/24
 ```
 
-### Build awg CLI tool (via Docker)
+## Updates
 
-```shell
-# ARM64 (aarch64) — main Dockerfile
-./build.sh
+AmneziaWG automatically checks for new versions.
 
-# ARM32 (static musl, works on both armv7-2.6 and armv7-3.2)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.arm32 --output=output .
-```
+When an update is available, information about it is displayed in the web interface.
 
-### Build .ipk package
+Updates can be installed directly from the AmneziaWG web interface.
 
-```shell
-./build-ipk.sh
-```
+User settings and configuration are preserved during normal updates.
 
-Output: `output/amneziawg_1.0.0-1_aarch64-3.10.ipk`
+## SSH Management
 
-## Standalone VPS builder
+### Start
 
-The `server/` directory contains a builder that does not use GitHub Actions. It
-checks the official `amneziawg-go` and `amneziawg-tools` tags, builds the ARM64
-package with Docker, keeps a local copy under `/opt/awg-merlin-releases`, and
-publishes the `.ipk` plus `SHA256SUMS` to GitHub Releases. The router UI displays
-installed and available versions and verifies SHA-256 before installation.
-
-Manual build:
-
-```shell
-cd /opt/awg-merlin-builder
-./server/awg-merlin-builder.sh --force
-```
-
-Periodic checks use `awg-merlin-builder.service` and
-`awg-merlin-builder.timer`.
-
-## CLI usage
-
-```shell
-# Start/stop/restart
+```sh
 /opt/etc/init.d/S99amneziawg start
-/opt/etc/init.d/S99amneziawg stop
-/opt/etc/init.d/S99amneziawg restart
-
-# Show tunnel status
-awg show
-
-# Update geo lists
-/jffs/addons/amneziawg/amneziawg.sh update_geo
 ```
 
-## How to uninstall
+### Stop
 
-```shell
+```sh
+/opt/etc/init.d/S99amneziawg stop
+```
+
+### Restart
+
+```sh
+/opt/etc/init.d/S99amneziawg restart
+```
+
+### AmneziaWG status
+
+```sh
+awg show
+```
+
+## Uninstallation
+
+To remove AmneziaWG:
+
+```sh
 /jffs/addons/amneziawg/amneziawg.sh uninstall
 opkg remove amneziawg
 ```
 
-## Architecture
+## Main components
 
-```
-Internet <-- awg0 (tunnel) <-- iptables mangle AWG chain <-- br0 (LAN devices)
-                                        |
-                                ipset awg_dst (GeoIP CIDRs + DNS-resolved IPs)
-                                        |
-                                fwmark 0x100 -> routing table 300 -> awg0
-```
+| Component | Purpose |
+|---|---|
+| `amneziawg-go` | Userspace implementation of AmneziaWG |
+| `awg` | CLI for managing the AmneziaWG interface |
+| `amneziawg.sh` | Manages AmneziaWG, routing, and network rules |
+| `amneziawg_page.asp` | Web interface for Asuswrt-Merlin |
 
-| Component | Role |
-|-----------|------|
-| **amneziawg-go** | Userspace WireGuard daemon with AmneziaWG extensions |
-| **awg** | CLI tool for tunnel management (works with kernel and userspace) |
-| **amneziawg.sh** | Backend: lifecycle, firewall, routing, geo lists, DNS interception |
-| **amneziawg_page.asp** | Web UI addon page for Merlin |
+## Acknowledgements
 
-## FAQ
+- AmneziaWG — protocol and implementations
+- [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) — router firmware
+- [Entware](https://github.com/Entware/Entware) — package system
+- [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) — GeoIP lists
+- [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) — domain lists
+- [DanielLavrushin/asuswrt-merlin-xrayui](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui) — architectural reference
 
-**Q: Telegram doesn't work through VPN?**
+## Legal information
 
-A: Add `telegram` to GeoIP Service Lists. Telegram connects by IP, not DNS -- domain lists alone won't work.
+The software is provided solely for technical and research purposes.
 
-**Q: Sites don't open on iPhone with VPN Geo policy?**
+Users are solely responsible for complying with the laws of the country in which the software is used.
 
-A: iPhone uses encrypted DNS (DoH) which bypasses the router's dnsmasq. Set DNS manually: Settings > Wi-Fi > (i) > DNS > Manual > router IP only.
-
-**Q: Tunnel works for ping but not for websites?**
-
-A: Restart the tunnel with a pause: `/jffs/addons/amneziawg/amneziawg.sh stop; sleep 5; /jffs/addons/amneziawg/amneziawg.sh start`
-
-**Q: How to add a custom service by IP?**
-
-A: Add CIDR ranges in Custom IPs field, e.g. `149.154.160.0/20,91.108.4.0/22` for Telegram.
-
-## Credits
-
-- [AmneziaWG](https://github.com/amnezia-vpn) -- protocol and implementations
-- [Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip) -- GeoIP service CIDR lists
-- [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) -- domain lists
-- [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) -- router firmware
-- [DanielLavrushin/asuswrt-merlin-xrayui](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui) -- routing architecture reference
-
-## Author
-
-**r0otx** -- [github.com/r0otx](https://github.com/r0otx)
-
-## Disclaimer
-
-This project is a technical tool for network security and privacy. The author is not responsible for any use of this software that violates the laws of any jurisdiction. Users are solely responsible for compliance with applicable legislation.
+The project author is not responsible for use of the software in violation of applicable law.
 
 ## License
 
