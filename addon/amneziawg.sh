@@ -4,7 +4,7 @@
 # Userspace amneziawg-go, per-device policy routing, GeoIP/GeoSite
 # =============================================================
 
-AWG_VERSION="1.2.0"
+AWG_VERSION="2.2.0"
 ADDON_DIR="/jffs/addons/amneziawg"
 AWG_DIR="/opt/amneziawg"
 CONF="$AWG_DIR/awg0.conf"
@@ -65,7 +65,8 @@ flush_conntrack(){
 save_and_set_rp_filter(){
     for iface in all awg0 br0; do
         local f="/proc/sys/net/ipv4/conf/$iface/rp_filter"
-        [ -f "$f" ] && cat "$f" > "/tmp/.awg_rp_$iface" 2>/dev/null
+        [ -f "$f" ] || continue
+        cat "$f" > "/tmp/.awg_rp_$iface" 2>/dev/null
         echo 2 > "$f" 2>/dev/null
     done
 }
@@ -75,7 +76,7 @@ restore_rp_filter(){
         local saved="/tmp/.awg_rp_$iface"
         local f="/proc/sys/net/ipv4/conf/$iface/rp_filter"
         if [ -f "$saved" ]; then
-            cat "$saved" > "$f" 2>/dev/null
+            [ -f "$f" ] && cat "$saved" > "$f" 2>/dev/null
             rm -f "$saved"
         fi
     done
@@ -100,6 +101,25 @@ wait_for_dns(){
         sleep 1
         i=$((i + 1))
     done
+    return 1
+}
+
+# Restart dnsmasq and wait until the replacement daemon has loaded its config.
+restart_dnsmasq_and_wait(){
+    local old_pid current_pid i=0 max="${1:-15}"
+    old_pid=$(pidof dnsmasq 2>/dev/null)
+    service restart_dnsmasq >/dev/null 2>&1
+    while [ $i -lt "$max" ]; do
+        current_pid=$(pidof dnsmasq 2>/dev/null)
+        if [ -n "$current_pid" ] && nslookup localhost 127.0.0.1 >/dev/null 2>&1; then
+            if [ -z "$old_pid" ] || [ "$current_pid" != "$old_pid" ] || [ $i -ge 3 ]; then
+                return 0
+            fi
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    log_msg "WARNING: dnsmasq restart timeout"
     return 1
 }
 
@@ -518,8 +538,7 @@ setup_firewall(){
 
     # --- Restart dnsmasq if geo active ---
     if [ $domain_count -gt 0 ] || [ "$has_geo" = true ]; then
-        service restart_dnsmasq >/dev/null 2>&1
-        wait_for_dns 10
+        restart_dnsmasq_and_wait 15
         # Pre-resolve domains to populate ipset
         if [ -f "$DNSMASQ_AWG_CONF" ]; then
             local bg_count=0
@@ -895,8 +914,7 @@ do_stop(){
     fi
     rm -f /var/run/amneziawg/"$IFACE".sock
 
-    service restart_dnsmasq >/dev/null 2>&1 &
-    wait_for_dns 10
+    restart_dnsmasq_and_wait 15
 
     log_msg "Stopped"
     update_status
