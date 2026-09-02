@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+if [ -z "${HOME:-}" ] && [ "$(id -u)" -eq 0 ]; then
+    export HOME=/root
+fi
+export GH_CONFIG_DIR="${GH_CONFIG_DIR:-${HOME}/.config/gh}"
+
 
 ROOT_DIR="${AWG_BUILDER_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 PUBLISH_REPO="${AWG_PUBLISH_REPO:-Supper1990/asuswrt-merlin-amneziawg-3.1}"

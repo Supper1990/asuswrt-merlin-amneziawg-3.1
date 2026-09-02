@@ -6,6 +6,8 @@ After=network-online.target docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/awg-merlin-builder
+Environment=HOME=/root
+Environment=GH_CONFIG_DIR=/root/.config/gh
 ExecStart=/opt/awg-merlin-builder/server/awg-merlin-builder.sh
 Nice=10
 IOSchedulingClass=idle
