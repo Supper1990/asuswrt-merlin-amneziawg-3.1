@@ -27,7 +27,6 @@ LOCKDIR="/tmp/.awg_lock"
 AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
 UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
 V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text"
-GEOIP_SERVICES="telegram google facebook twitter netflix cloudflare fastly cloudfront"
 
 # Ensure Entware binaries are in PATH (not set when called from httpd/service-event)
 export PATH="/opt/bin:/opt/sbin:$PATH"
@@ -335,11 +334,45 @@ human_size(){
     fi
 }
 
-# Download a single GeoIP service list (IPv4 only)
+valid_geo_service_name(){
+    case "$1" in
+        ""|.*|*..*|*[!a-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+selected_geoip_services(){
+    local raw svc selected=""
+    raw=$(get_setting awg_geo_v2fly_ip)
+    for svc in $(echo "$raw" | tr ',' ' '); do
+        svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+        valid_geo_service_name "$svc" || continue
+        case " $selected " in
+            *" $svc "*) ;;
+            *) selected="$selected $svc" ;;
+        esac
+    done
+    echo "$selected"
+}
+
+prune_unselected_geoip_lists(){
+    local selected_services="$1" old_file old_svc
+    for old_file in "$GEO_DIR"/geoip/v2fly_*.cidr; do
+        [ -f "$old_file" ] || continue
+        old_svc=${old_file##*/v2fly_}
+        old_svc=${old_svc%.cidr}
+        case " $selected_services " in
+            *" $old_svc "*) ;;
+            *) rm -f "$old_file" ;;
+        esac
+    done
+}
+
+# Download a single selected GeoIP service list (IPv4 only)
 download_geoip_service(){
     local svc="$1"
     svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
-    [ -z "$svc" ] && return 1
+    valid_geo_service_name "$svc" || return 1
     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
         grep -v ":" "$tmp" > "$GEO_DIR/geoip/v2fly_${svc}.cidr"
@@ -356,12 +389,14 @@ download_all_geo(){
     mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains"
     log_msg "Downloading all geo databases..."
 
-    # Download all GeoIP service CIDR lists
+    # Download only GeoIP service lists selected in the web interface.
+    local selected_services
+    selected_services=$(selected_geoip_services)
     local count=0 total=0 ok=0
-    for svc in $GEOIP_SERVICES; do
+    for svc in $selected_services; do
         total=$((total + 1))
     done
-    for svc in $GEOIP_SERVICES; do
+    for svc in $selected_services; do
         count=$((count + 1))
         log_msg "GeoIP: downloading $svc ($count/$total)..."
         if download_geoip_service "$svc"; then
@@ -373,6 +408,10 @@ download_all_geo(){
     done
     log_msg "GeoIP: $ok/$total service lists downloaded"
 
+    # Remove generated lists that are no longer selected. Files without the
+    # v2fly_ prefix are treated as locally managed lists and are preserved.
+    prune_unselected_geoip_lists "$selected_services"
+
     # Download v2fly domain database
     log_msg "Downloading v2fly domain database..."
     update_status
@@ -381,7 +420,9 @@ download_all_geo(){
         -o "$tmp_yml" 2>/dev/null; then
         if [ -s "$tmp_yml" ]; then
             mv "$tmp_yml" "$GEO_DIR/v2fly_all.yml"
-            grep '  - name: ' "$GEO_DIR/v2fly_all.yml" | sed 's/.*- name: //' | sort > "$GEO_DIR/v2fly_categories.txt"
+            grep -E '^[[:space:]]*- name:' "$GEO_DIR/v2fly_all.yml" | \
+                sed 's/.*- name:[[:space:]]*//;s/^"//;s/"$//' | \
+                sort > "$GEO_DIR/v2fly_categories.txt"
             cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
             log_msg "GeoSite: $(wc -l < "$GEO_DIR/v2fly_categories.txt") categories downloaded"
         else
@@ -504,10 +545,22 @@ setup_firewall(){
         has_geo=false
     fi
 
-    # --- Load GeoIP subnets into ipset (bulk) ---
-    local ip_count=0
+    # --- Load selected GeoIP subnets into ipset (bulk) ---
+    local ip_count=0 f svc
+    local selected_services
+    selected_services=$(selected_geoip_services)
+    prune_unselected_geoip_lists "$selected_services"
+    for svc in $selected_services; do
+        f="$GEO_DIR/geoip/v2fly_${svc}.cidr"
+        [ ! -f "$f" ] && continue
+        ipset_load_file "$f" "$IPSET_NAME"
+        ip_count=$((ip_count + $(wc -l < "$f")))
+    done
+
+    # Preserve support for explicitly installed local CIDR files.
     for f in "$GEO_DIR"/geoip/*.cidr; do
         [ ! -f "$f" ] && continue
+        case "${f##*/}" in v2fly_*.cidr) continue ;; esac
         ipset_load_file "$f" "$IPSET_NAME"
         ip_count=$((ip_count + $(wc -l < "$f")))
     done
@@ -520,17 +573,37 @@ setup_firewall(){
 
     # --- Extract v2fly domains from downloaded database ---
     local geo_v2fly=$(get_setting awg_geo_v2fly)
+    rm -f "$GEO_DIR/domains/v2fly_"*.txt
     if [ -n "$geo_v2fly" ] && [ -f "$GEO_DIR/v2fly_all.yml" ]; then
-        rm -f "$GEO_DIR/domains/v2fly_"*.txt
         for svc in $(echo "$geo_v2fly" | tr ',' ' '); do
-            svc=$(echo "$svc" | tr -d ' ')
-            [ -z "$svc" ] && continue
+            svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+            valid_geo_service_name "$svc" || {
+                log_msg "WARNING: Invalid GeoSite category: $svc"
+                continue
+            }
             awk -v cat="$svc" '
-                /^  - name: / { name=$NF; found=(name==cat); next }
-                found && /^      - "domain:/ { sub(/.*"domain:/,""); sub(/".*/,""); print }
-                found && /^      - "full:/ { sub(/.*"full:/,""); sub(/".*/,""); print }
-                found && /^  - name: / { if(found) exit }
+                /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
+                    name=$0
+                    sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name)
+                    sub(/^"/, "", name); sub(/"[[:space:]]*$/, "", name)
+                    found=(name==cat)
+                    next
+                }
+                found && /^[[:space:]]*-[[:space:]]*/ {
+                    rule=$0
+                    sub(/^[[:space:]]*-[[:space:]]*/, "", rule)
+                    sub(/^"/, "", rule); sub(/"[[:space:]]*$/, "", rule)
+                    if (rule ~ /^(domain|full):/) {
+                        sub(/^[^:]*:/, "", rule)
+                        sub(/:@[^:]*$/, "", rule)
+                        if (rule != "") print rule
+                    }
+                }
             ' "$GEO_DIR/v2fly_all.yml" > "$GEO_DIR/domains/v2fly_${svc}.txt"
+            if [ ! -s "$GEO_DIR/domains/v2fly_${svc}.txt" ]; then
+                rm -f "$GEO_DIR/domains/v2fly_${svc}.txt"
+                log_msg "WARNING: GeoSite category empty or not found: $svc"
+            fi
         done
     fi
 
@@ -539,6 +612,8 @@ setup_firewall(){
     if [ -n "$custom_domains" ]; then
         mkdir -p "$GEO_DIR/domains"
         echo "$custom_domains" | tr ',' '\n' > "$GEO_DIR/domains/custom.txt"
+    else
+        rm -f "$GEO_DIR/domains/custom.txt"
     fi
     local custom_ips=$(get_setting awg_geo_custom_ips)
     if [ -n "$custom_ips" ]; then
@@ -566,7 +641,7 @@ setup_firewall(){
     # --- Build dnsmasq config for domain-based routing ---
     local domain_count=0
     echo "# AmneziaWG domain routing - auto-generated" > "$DNSMASQ_AWG_CONF"
-    for f in "$GEO_DIR"/domains/*.txt "$GEO_DIR"/domains/*.lst; do
+    for f in "$GEO_DIR/domains/custom.txt" "$GEO_DIR"/domains/v2fly_*.txt; do
         [ ! -f "$f" ] && continue
         local chunk_line="ipset=/"
         local chunk_count=0
@@ -741,12 +816,24 @@ save_clients(){
 
 # Check if geo databases exist locally
 geo_available(){
-    [ -d "$GEO_DIR/geoip" ] && [ -n "$(ls "$GEO_DIR/geoip/"*.cidr 2>/dev/null)" ]
+    local svc
+    for svc in $(selected_geoip_services); do
+        [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] || return 1
+    done
+    [ -n "$(get_setting awg_geo_v2fly)" ] && [ ! -s "$GEO_DIR/v2fly_all.yml" ] && return 1
+    return 0
 }
 
 update_geo_if_needed(){
-    if ! geo_available; then
-        log_msg "WARNING: Geo databases not downloaded. Use Update Now in web UI."
+    local svc
+    mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains"
+    for svc in $(selected_geoip_services); do
+        [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] && continue
+        log_msg "GeoIP: downloading newly selected $svc..."
+        download_geoip_service "$svc" || log_msg "WARNING: GeoIP $svc download failed"
+    done
+    if [ -n "$(get_setting awg_geo_v2fly)" ] && [ ! -s "$GEO_DIR/v2fly_all.yml" ]; then
+        log_msg "WARNING: GeoSite database not downloaded. Use Update Now in web UI."
     fi
 }
 

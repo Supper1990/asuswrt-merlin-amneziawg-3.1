@@ -148,6 +148,7 @@ Run an update manually:
 GeoIP provides routing by IP addresses and CIDR networks.
 
 You can use predefined lists and add your own addresses and networks through **Custom IPs**.
+Only categories selected in **GeoIP Service Lists** are loaded into `awg_dst`; deselected categories are removed when settings are applied. GeoSite categories are parsed from the current `dlc.dat_plain.yml` format, and clearing GeoSite or Custom Domains no longer leaves stale rules behind.
 
 Example:
 
