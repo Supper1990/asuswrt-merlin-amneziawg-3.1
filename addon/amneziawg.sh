@@ -49,11 +49,18 @@ remove_managed_cron(){
     cru d AWG_DAILY_UPDATE 2>/dev/null
 }
 
+antifilter_enabled(){
+    # Backward-compatible default: enabled when the setting does not exist.
+    [ "$(get_setting awg_antifilter_enabled)" != "0" ]
+}
+
 register_managed_cron(){
     remove_managed_cron
     cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
     # Offset from the built-in GeoIP update to avoid two heavy jobs at 04:00.
-    cru a awg_myawg_update "10 4 * * * '$AUX_IPSET_SCRIPT' --update"
+    if antifilter_enabled; then
+        cru a awg_myawg_update "10 4 * * * '$AUX_IPSET_SCRIPT' --update"
+    fi
     if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
         cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
     fi
@@ -61,10 +68,26 @@ register_managed_cron(){
 
 repair_aux_routing(){
     [ -x "$AUX_IPSET_SCRIPT" ] || return 0
+    if ! antifilter_enabled; then
+        "$AUX_IPSET_SCRIPT" --disable 2>/dev/null
+        return 0
+    fi
     "$AUX_IPSET_SCRIPT" --repair || {
         log_msg "WARNING: MYAWG table 400 repair failed"
         return 1
     }
+}
+
+update_antifilter(){
+    [ -x "$AUX_IPSET_SCRIPT" ] || {
+        log_msg "ERROR: AntiFilter updater not found"
+        return 1
+    }
+    if ! antifilter_enabled; then
+        log_msg "AntiFilter update skipped: disabled"
+        return 1
+    fi
+    "$AUX_IPSET_SCRIPT" --update
 }
 
 ensure_ui_mark_nat(){
@@ -1116,6 +1139,12 @@ EOF
     ipset list "$IPSET_NAME" -t 2>/dev/null | grep -q "Number of entries" && \
         ipset_count=$(ipset list "$IPSET_NAME" -t 2>/dev/null | awk '/Number of entries/{print $NF}')
 
+    local antifilter_active=false
+    local antifilter_count=0
+    antifilter_enabled && antifilter_active=true
+    ipset list MYAWG -t 2>/dev/null | grep -q "Number of entries" && \
+        antifilter_count=$(ipset list MYAWG -t 2>/dev/null | awk '/Number of entries/{print $NF}')
+
     local geo_domains=0
     [ -f "$DNSMASQ_AWG_CONF" ] && geo_domains=$(grep -c "^ipset=" "$DNSMASQ_AWG_CONF" 2>/dev/null)
     [ -z "$geo_domains" ] && geo_domains=0
@@ -1132,7 +1161,7 @@ EOF
     [ -n "$tools_version" ] || tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $2}')
 
     cat > "$STATUS_FILE" << STATUSEOF
-{"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"log":"${log_text}"}
+{"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"antifilter_enabled":${antifilter_active},"antifilter_count":${antifilter_count},"log":"${log_text}"}
 STATUSEOF
 }
 
@@ -1454,12 +1483,20 @@ do_service_event(){
             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(get_setting awg_privatekey)" ]; do sleep 1; _wt=$((_wt+1)); done
             generate_config
             update_geo_if_needed
-            is_running && setup_firewall
+            if is_running; then
+                setup_firewall
+            elif ! antifilter_enabled; then
+                disable_aux_routing
+            fi
             update_status
             ;;
         awgupdategeo)
             update_geo_lists
             is_running && setup_firewall
+            update_status
+            ;;
+        awgupdateantifilter)
+            update_antifilter
             update_status
             ;;
         awgcheckupdate)
@@ -1480,7 +1517,7 @@ case "$1" in
     restart)        do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
     status)         update_status ;;
     update_geo)     update_geo_lists; is_running && setup_firewall; update_status ;;
-    update_ipset)   "$AUX_IPSET_SCRIPT" --update ;;
+    update_ipset)   update_antifilter ;;
     check_update)   check_update ;;
     update)         do_update ;;
     watchdog)       do_watchdog ;;

@@ -32,6 +32,7 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 - **Return-path protection** — the watchdog maintains loose `rp_filter` on `awg0` and incoming VPN interfaces
 - **Firewall monitoring** — the watchdog validates core rules, NAT, and table 300 and rebuilds them only when something is missing
 - **ipset monitoring** — the watchdog rebuilds `awg_dst` when it disappears or its static entry count falls below a safe threshold
+- **AntiFilter controls** — the separate list can be enabled, disabled, and updated manually from the web interface; it is enabled by default
 
 ## Requirements
 
@@ -129,8 +130,11 @@ The package separately maintains `https://antifilter.download/list/allyouneed.ls
 
 - `awg_dst`, mark `0x100`, and table 300 are managed by the web interface;
 - `MYAWG`, mark `0x66`, and table 400 are managed by `awg-ipset-update.sh`;
-- the watchdog repairs the rules and table 400 every 5 minutes without downloading the list;
-- the list is updated daily at 04:10.
+- the **Enable AntiFilter** web-interface switch enables or completely removes its rules, NAT, table 400, and cron job;
+- AntiFilter is enabled by default;
+- the watchdog repairs its rules and table 400 every 5 minutes and restores a depleted `MYAWG` from the local cache;
+- when AntiFilter is enabled, its list is updated daily at 04:10;
+- **Update AntiFilter Now** starts a manual update.
 
 Run an update manually:
 

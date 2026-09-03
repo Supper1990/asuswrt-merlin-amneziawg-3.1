@@ -100,6 +100,8 @@ var custom_settings = <% get_custom_settings(); %>;
 var statusTimer = null;
 var v2flyList = [];
 var v2flyIpList = ['telegram','google','facebook','twitter','netflix','cloudflare','fastly','cloudfront'];
+var antifilterRuntimeEnabled = true;
+var awgRuntimeRunning = false;
 function escHtml(s){
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
@@ -274,6 +276,7 @@ function loadSettings(){
     loadClients();
     // Load geo settings
     loadGeoSettings();
+    loadAntiFilterSettings();
     updateGeoVisibility();
 }
 
@@ -319,6 +322,7 @@ function saveSettings(){
     custom_settings.awg_geo_custom_domains = document.getElementById('geo_custom_domains').value;
     custom_settings.awg_geo_custom_ips = document.getElementById('geo_custom_ips').value;
     custom_settings.awg_geo_autoupdate = document.getElementById('geo_autoupdate').checked ? '1' : '0';
+    custom_settings.awg_antifilter_enabled = document.getElementById('antifilter_enabled').checked ? '1' : '0';
 
     // Basic validation
     var pk = document.getElementById('awg_privatekey').value;
@@ -416,6 +420,62 @@ function loadGeoSettings(){
     // Auto-update
     var au = document.getElementById('geo_autoupdate');
     if(au) au.checked = (custom_settings.awg_geo_autoupdate === '1');
+}
+
+function loadAntiFilterSettings(){
+    var enabled = (custom_settings.awg_antifilter_enabled !== '0');
+    var cb = document.getElementById('antifilter_enabled');
+    antifilterRuntimeEnabled = enabled;
+    if(cb) cb.checked = enabled;
+    updateAntiFilterControls();
+}
+
+function antiFilterSettingChanged(){
+    var cb = document.getElementById('antifilter_enabled');
+    var status = document.getElementById('antifilter_status');
+    if(status && cb && cb.checked !== antifilterRuntimeEnabled){
+        status.textContent = 'Click Apply to save this change';
+        status.style.color = '#fc0';
+    } else {
+        updateAntiFilterControls();
+    }
+}
+
+function updateAntiFilterControls(count){
+    var btn = document.getElementById('btn_antifilter_update');
+    var status = document.getElementById('antifilter_status');
+    if(btn) btn.disabled = (!antifilterRuntimeEnabled || !awgRuntimeRunning);
+    if(status){
+        if(!antifilterRuntimeEnabled){
+            status.textContent = 'Disabled';
+            status.style.color = '#aaa';
+        } else if(!awgRuntimeRunning){
+            status.textContent = 'Enabled; start AmneziaWG to update';
+            status.style.color = '#aaa';
+        } else {
+            status.textContent = 'Enabled' + (count > 0 ? ' — ' + count + ' IP ranges' : '');
+            status.style.color = '#9f9';
+        }
+    }
+}
+
+function updateAntiFilter(){
+    if(!antifilterRuntimeEnabled){
+        alert('AntiFilter is disabled. Enable it and click Apply first.');
+        return;
+    }
+    if(!awgRuntimeRunning){
+        alert('Start AmneziaWG before updating AntiFilter.');
+        return;
+    }
+    if(!confirm('Download and apply the latest AntiFilter list now?')) return;
+    var btn = document.getElementById('btn_antifilter_update');
+    var status = document.getElementById('antifilter_status');
+    if(btn) btn.disabled = true;
+    if(status){ status.textContent = 'Updating AntiFilter...'; status.style.color = '#fc0'; }
+    document.form.action_script.value = "start_awgupdateantifilter";
+    document.form.submit();
+    setTimeout(function(){ location.reload(); }, 60000);
 }
 
 function getCheckedValues(prefix){
@@ -642,6 +702,12 @@ function updateStatusUI(s){
         document.getElementById('btn_stop').style.display = 'none';
         document.getElementById('btn_restart').style.display = 'none';
     }
+    awgRuntimeRunning = !!s.running;
+    if(s.antifilter_enabled !== undefined){
+        antifilterRuntimeEnabled = !!s.antifilter_enabled;
+    }
+    updateAntiFilterControls(parseInt(s.antifilter_count || 0, 10));
+    antiFilterSettingChanged();
 
     info.innerHTML = '';
     if(s.interface_addr) info.innerHTML += 'Address: ' + escHtml(s.interface_addr) + '<br>';
@@ -696,6 +762,8 @@ function setOfflineUI(){
     document.getElementById('btn_start').style.display = '';
     document.getElementById('btn_stop').style.display = 'none';
     document.getElementById('btn_restart').style.display = 'none';
+    awgRuntimeRunning = false;
+    updateAntiFilterControls();
 }
 
 var _initParams = {};
@@ -1187,6 +1255,26 @@ function initAutocompleteIp(){
                     <input type="button" class="button_gen" value="+ Add Device" onclick="addClientRow('','','vpn_all');">
                     <input type="button" class="button_gen" value="+ From DHCP List" onclick="fetchDhcpClients();" style="margin-left:6px;">
                 </div>
+
+                <!-- ==================== ANTIFILTER ==================== -->
+                <div class="awg-section" style="margin-top:15px;">AntiFilter</div>
+                <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable">
+                <thead><tr><td colspan="2">Additional AntiFilter Routing List</td></tr></thead>
+                <tr>
+                    <th width="35%">Enable AntiFilter</th>
+                    <td>
+                        <label><input type="checkbox" id="antifilter_enabled" onchange="antiFilterSettingChanged();"> Enabled</label>
+                        <span style="color:#888; font-size:11px; margin-left:8px;">Uses MYAWG, mark 0x66 and table 400. Enabled by default.</span>
+                    </td>
+                </tr>
+                <tr>
+                    <th>List Update</th>
+                    <td>
+                        <input type="button" class="button_gen" id="btn_antifilter_update" value="Update AntiFilter Now" onclick="updateAntiFilter();">
+                        <span id="antifilter_status" style="margin-left:8px; font-size:11px; color:#aaa;">Loading...</span>
+                    </td>
+                </tr>
+                </table>
 
                 <!-- ==================== GEO ROUTING ==================== -->
                 <div id="geo_section" style="display:none;">

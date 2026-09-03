@@ -165,6 +165,8 @@ disable_routing(){
     done
     ip route flush table "$TABLE" 2>/dev/null
     ip route flush cache 2>/dev/null
+    ipset destroy "$TMP_SET" 2>/dev/null
+    ipset destroy "$SET" 2>/dev/null
 }
 
 full_rebuild_from_new_list(){
@@ -192,9 +194,9 @@ full_rebuild_from_new_list(){
 restore_from_cache_if_needed(){
     count=$(ipset_count)
     [ -n "$count" ] || count=0
-    [ "$count" -gt 0 ] 2>/dev/null && return 0
+    [ "$count" -ge "$MIN_NETS" ] 2>/dev/null && return 0
     [ -s "$OLD_LIST" ] || { log "ipset empty and no cached list"; return 1; }
-    log "Restoring ipset from cache"
+    log "Restoring depleted ipset from cache (entries: $count)"
     cp "$OLD_LIST" "$NEW_LIST"
     full_rebuild_from_new_list
 }
@@ -213,7 +215,11 @@ incremental_update(){
 
 repair_runtime(){
     ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
-    restore_from_cache_if_needed || true
+    if ! restore_from_cache_if_needed; then
+        log "No usable cached list; downloading AntiFilter"
+        update_list
+        return $?
+    fi
     ensure_routing
 }
 
