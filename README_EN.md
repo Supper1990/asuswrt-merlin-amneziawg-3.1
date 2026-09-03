@@ -26,6 +26,8 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 - **Automatic AmneziaWG update checks**
 - **Install updates from the web interface**
 - **Preserve user settings and configuration during normal updates**
+- **Two independent routing lists** — the web UI uses `awg_dst`/table 300, while the AntiFilter list uses `MYAWG`/table 400
+- **Automatic route repair** — the watchdog restores table 400 after `awg0` is recreated, while cron updates the AntiFilter list daily
 
 ## Requirements
 
@@ -116,6 +118,21 @@ Only traffic matching selected GeoIP, GeoSite, and custom rules is routed throug
 ### Direct connection
 
 Traffic from the selected device is routed directly.
+
+### Additional AntiFilter list
+
+The package separately maintains `https://antifilter.download/list/allyouneed.lst`:
+
+- `awg_dst`, mark `0x100`, and table 300 are managed by the web interface;
+- `MYAWG`, mark `0x66`, and table 400 are managed by `awg-ipset-update.sh`;
+- the watchdog repairs the rules and table 400 every 5 minutes without downloading the list;
+- the list is updated daily at 04:10.
+
+Run an update manually:
+
+```sh
+/jffs/addons/amneziawg/amneziawg.sh update_ipset
+```
 
 ## GeoIP
 
@@ -212,6 +229,7 @@ opkg remove amneziawg
 | `amneziawg-go` | Userspace implementation of AmneziaWG |
 | `awg` | CLI for managing the AmneziaWG interface |
 | `amneziawg.sh` | Manages AmneziaWG, routing, and network rules |
+| `awg-ipset-update.sh` | Updates the AntiFilter ipset and maintains separate routing table 400 |
 | `amneziawg_page.asp` | Web interface for Asuswrt-Merlin |
 
 ## Acknowledgements

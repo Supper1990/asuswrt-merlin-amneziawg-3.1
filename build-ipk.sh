@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-6"
+PKG_VERSION="2.2.0-7"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
@@ -75,6 +75,7 @@ for file in /opt/amneziawg/amneziawg-go /opt/amneziawg/awg; do
 done
 chmod +x /opt/etc/init.d/S99amneziawg
 chmod +x /jffs/addons/amneziawg/amneziawg.sh
+chmod +x /jffs/addons/amneziawg/awg-ipset-update.sh
 ln -sf /opt/amneziawg/awg /opt/bin/awg
 mkdir -p /opt/amneziawg/geo/geoip /opt/amneziawg/geo/domains
 mkdir -p -m 700 /var/run/amneziawg
@@ -131,11 +132,13 @@ PRERMEOF
     printf '%s\n' "$AWG_GO_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-go.version"
     printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
     cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
+    cp addon/awg-ipset-update.sh      "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
     cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 
     chmod 755 "$DATA_DIR/opt/amneziawg/amneziawg-go"
     chmod 755 "$DATA_DIR/opt/amneziawg/awg"
     chmod 755 "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
+    chmod 755 "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
     chmod 644 "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 
     cd "$DATA_DIR/opt/bin"

@@ -23,6 +23,7 @@ SCRIPT_NAME="amneziawg"
 RT_TABLE=300
 AWG_CHAIN="AWG"
 LOCKDIR="/tmp/.awg_lock"
+AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
 UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
 V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text"
 GEOIP_SERVICES="telegram google facebook twitter netflix cloudflare fastly cloudfront"
@@ -34,6 +35,52 @@ export PATH="/opt/bin:/opt/sbin:$PATH"
 
 log_msg(){
     logger -t "$SCRIPT_NAME" "$1"
+}
+
+remove_managed_cron(){
+    cru d awg_geo_update 2>/dev/null
+    cru d awg_watchdog 2>/dev/null
+    cru d awg_myawg_update 2>/dev/null
+
+    # Names used by the legacy standalone script.
+    cru d AWG_CHECK 2>/dev/null
+    cru d AWG_IPSET 2>/dev/null
+    cru d AWG_DAILY_UPDATE 2>/dev/null
+}
+
+register_managed_cron(){
+    remove_managed_cron
+    cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+    # Offset from the built-in GeoIP update to avoid two heavy jobs at 04:00.
+    cru a awg_myawg_update "10 4 * * * '$AUX_IPSET_SCRIPT' --update"
+    if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
+        cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
+    fi
+}
+
+repair_aux_routing(){
+    [ -x "$AUX_IPSET_SCRIPT" ] || return 0
+    "$AUX_IPSET_SCRIPT" --repair || {
+        log_msg "WARNING: MYAWG table 400 repair failed"
+        return 1
+    }
+}
+
+disable_aux_routing(){
+    [ -x "$AUX_IPSET_SCRIPT" ] && "$AUX_IPSET_SCRIPT" --disable 2>/dev/null
+}
+
+migrate_legacy_ipset(){
+    remove_managed_cron
+
+    # Disable the old boot hook, but keep a recoverable copy of the user's script.
+    if [ -f /jffs/scripts/awg-ipset-update.sh ] && \
+       [ ! -f /jffs/scripts/awg-ipset-update.sh.pre-amneziawg-addon ]; then
+        cp /jffs/scripts/awg-ipset-update.sh \
+            /jffs/scripts/awg-ipset-update.sh.pre-amneziawg-addon
+    fi
+    [ -f /jffs/scripts/services-start ] && \
+        sed -i '\|/jffs/scripts/awg-ipset-update.sh|d' /jffs/scripts/services-start
 }
 
 get_setting(){
@@ -330,10 +377,6 @@ cleanup_firewall(){
     rm -f "$DNSMASQ_AWG_CONF"
     [ -f "$DNSMASQ_INCLUDE" ] && sed -i "\|${DNSMASQ_AWG_CONF}|d" "$DNSMASQ_INCLUDE"
 
-    # Remove cron
-    cru d awg_geo_update 2>/dev/null
-    cru d awg_watchdog 2>/dev/null
-
     cleanup_ipv6_block
 
     log_msg "Firewall rules cleaned"
@@ -556,10 +599,9 @@ setup_firewall(){
     # --- Always flush conntrack so devices reconnect through VPN ---
     flush_conntrack
 
-    # --- Setup cron ---
-    if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
-        cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
-    fi
+    # Keep both independent routing systems healthy after every firewall rebuild.
+    repair_aux_routing
+    register_managed_cron
 
     log_msg "Firewall configured: $ip_count IPs, $domain_count domains"
 }
@@ -773,6 +815,8 @@ do_start(){
 
     if is_running; then
         log_msg "Already running"
+        repair_aux_routing
+        register_managed_cron
         update_status
         return 0
     fi
@@ -848,9 +892,6 @@ do_start(){
     awg_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
     [ -n "$awg_addr" ] && ip rule add from "$awg_addr" lookup $RT_TABLE prio 100
 
-    # Watchdog
-    cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
-
     log_msg "Started, verifying tunnel connectivity..."
     update_status
     release_lock
@@ -882,6 +923,8 @@ do_start(){
 do_stop(){
     acquire_lock || { log_msg "Cannot acquire lock, aborting stop"; return 1; }
 
+    remove_managed_cron
+
     iptables -D INPUT -i "$IFACE" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null
@@ -894,6 +937,7 @@ do_stop(){
     iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null
 
     cleanup_firewall
+    disable_aux_routing
 
     ip route flush table $RT_TABLE 2>/dev/null
     local endpoint
@@ -1000,6 +1044,9 @@ do_install_page(){
     mkdir -p "$ADDON_DIR"
     [ "$(readlink -f "$0")" != "$(readlink -f "$ADDON_DIR/amneziawg.sh")" ] && cp "$0" "$ADDON_DIR/amneziawg.sh"
     chmod +x "$ADDON_DIR/amneziawg.sh"
+    [ -f "$AUX_IPSET_SCRIPT" ] && chmod +x "$AUX_IPSET_SCRIPT"
+
+    migrate_legacy_ipset
 
     [ -f "/tmp/amneziawg_page.asp" ] && cp /tmp/amneziawg_page.asp "$ADDON_DIR/amneziawg_page.asp"
 
@@ -1038,6 +1085,11 @@ do_install_page(){
 
     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
 
+    if is_running; then
+        repair_aux_routing
+        register_managed_cron
+    fi
+
     log_msg "Page installed: $am_webui_page"
     echo "Installed. Access: VPN > AmneziaWG"
 }
@@ -1065,6 +1117,9 @@ do_mount_ui(){
 
 do_uninstall(){
     do_stop
+
+    [ -x "$AUX_IPSET_SCRIPT" ] && "$AUX_IPSET_SCRIPT" --cleanup 2>/dev/null
+    remove_managed_cron
 
     [ -f /jffs/scripts/service-event ] && sed -i '/amneziawg/d' /jffs/scripts/service-event
     [ -f /jffs/scripts/services-start ] && sed -i '/amneziawg/d' /jffs/scripts/services-start
@@ -1106,7 +1161,11 @@ do_watchdog(){
         do_stop 2>/dev/null
         wait_for_pid_exit amneziawg-go 10
         do_start
+        return $?
     fi
+
+    # Tunnel health alone is insufficient: awg0 recreation removes table 400.
+    repair_aux_routing
 }
 
 # --- Update check ---
@@ -1307,6 +1366,7 @@ case "$1" in
     restart)        do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
     status)         update_status ;;
     update_geo)     update_geo_lists; is_running && setup_firewall; update_status ;;
+    update_ipset)   "$AUX_IPSET_SCRIPT" --update ;;
     check_update)   check_update ;;
     update)         do_update ;;
     watchdog)       do_watchdog ;;
@@ -1317,5 +1377,5 @@ case "$1" in
     wan_event)      do_wan_event "$2" "$3" ;;
     firewall_restart) do_firewall_restart ;;
     download_geo)   download_all_geo ;;
-    *)              echo "Usage: $0 {start|stop|restart|status|update_geo|download_geo|install_page|uninstall}" ;;
+    *)              echo "Usage: $0 {start|stop|restart|status|update_geo|update_ipset|download_geo|install_page|uninstall}" ;;
 esac
