@@ -135,6 +135,7 @@ The package separately maintains `https://antifilter.download/list/allyouneed.ls
 - the watchdog repairs its rules and table 400 every 5 minutes and restores a depleted `MYAWG` from the local cache;
 - when AntiFilter is enabled, its list is updated daily at 04:10;
 - **Update AntiFilter Now** starts a manual update.
+- AntiFilter enable/disable events, update results, and errors are shown in the **Log** block.
 
 Run an update manually:
 

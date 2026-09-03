@@ -45,6 +45,7 @@ mkdir -p "$BASE"
 
 log(){
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
+    logger -t amneziawg-antifilter "$*" 2>/dev/null
 }
 
 ipset_count(){
@@ -81,6 +82,15 @@ get_endpoint_ip(){
         *[!0-9.]*|"") return 1 ;;
         *) echo "$endpoint" ;;
     esac
+}
+
+routing_is_active(){
+    ip rule show 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE" || return 1
+    ip route show table "$TABLE" 2>/dev/null | grep -q "^default dev $IFACE" || return 1
+    iptables -t mangle -C PREROUTING -j "$CHAIN" 2>/dev/null || return 1
+    iptables -t mangle -C OUTPUT -j "$CHAIN" 2>/dev/null || return 1
+    iptables -t nat -C POSTROUTING \
+        -m mark --mark "$MARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null
 }
 
 attach_chain_after_awg(){
@@ -152,6 +162,11 @@ ensure_routing(){
 }
 
 disable_routing(){
+    was_active=false
+    if routing_is_active || ipset list "$SET" >/dev/null 2>&1; then
+        was_active=true
+    fi
+
     delete_rule_all mangle PREROUTING -j "$CHAIN"
     delete_rule_all mangle OUTPUT -j "$CHAIN"
     iptables -t mangle -F "$CHAIN" 2>/dev/null
@@ -167,6 +182,7 @@ disable_routing(){
     ip route flush cache 2>/dev/null
     ipset destroy "$TMP_SET" 2>/dev/null
     ipset destroy "$SET" 2>/dev/null
+    [ "$was_active" = true ] && log "AntiFilter disabled"
 }
 
 full_rebuild_from_new_list(){
@@ -214,6 +230,8 @@ incremental_update(){
 }
 
 repair_runtime(){
+    was_active=false
+    routing_is_active && was_active=true
     ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
     if ! restore_from_cache_if_needed; then
         log "No usable cached list; downloading AntiFilter"
@@ -221,6 +239,9 @@ repair_runtime(){
         return $?
     fi
     ensure_routing
+    if [ "$was_active" != true ]; then
+        log "AntiFilter enabled; routing active with $(ipset_count) entries"
+    fi
 }
 
 update_list(){
@@ -262,7 +283,7 @@ update_list(){
 
     http_code=$(curl -K "$CURL_CONF" -w "%{http_code}" "$URL" 2>>"$LOG")
     if [ "$http_code" = "304" ]; then
-        log "Remote list not modified"
+        log "AntiFilter list not modified"
         restore_from_cache_if_needed || true
         ensure_routing
         log "===== UPDATE DONE ====="
@@ -295,7 +316,7 @@ update_list(){
     [ -n "$new_modified" ] && echo "$new_modified" > "$LM_FILE"
 
     if [ "$new_hash" = "$old_hash" ]; then
-        log "Hash unchanged"
+        log "AntiFilter list unchanged"
         restore_from_cache_if_needed || true
         ensure_routing
         log "===== UPDATE DONE ====="
@@ -329,7 +350,7 @@ update_list(){
     fi
 
     ensure_routing
-    log "Entries: $(ipset_count); table=$TABLE mark=$MARK iface=$IFACE"
+    log "AntiFilter list updated: $(ipset_count) entries"
     log "===== UPDATE DONE ====="
 }
 
