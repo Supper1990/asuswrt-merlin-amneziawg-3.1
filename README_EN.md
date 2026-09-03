@@ -30,6 +30,7 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 - **Automatic route repair** — the watchdog restores table 400 after `awg0` is recreated, while cron updates the AntiFilter list daily
 - **Incoming VPN client support** — mark-based NAT works for OpenVPN, IPsec, and other VPN-server interfaces
 - **Return-path protection** — the watchdog maintains loose `rp_filter` on `awg0` and incoming VPN interfaces
+- **Firewall monitoring** — the watchdog validates core rules, NAT, and table 300 and rebuilds them only when something is missing
 
 ## Requirements
 

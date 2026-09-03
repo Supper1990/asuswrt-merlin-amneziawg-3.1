@@ -122,6 +122,15 @@ get_endpoint(){
     awk -F'[ =:]+' '/^Endpoint/{print $2}' "$CONF" 2>/dev/null
 }
 
+ensure_main_routes(){
+    local lan_net
+    lan_net=$(get_lan_net)
+    ip route replace 0.0.0.0/1 dev "$IFACE" table $RT_TABLE
+    ip route replace 128.0.0.0/1 dev "$IFACE" table $RT_TABLE
+    [ -n "$lan_net" ] && ip route replace "$lan_net" dev br0 table $RT_TABLE
+    ip route flush cache 2>/dev/null
+}
+
 flush_conntrack(){
     if command -v conntrack >/dev/null 2>&1 && conntrack -D --mark "$FWMARK"/"$FWMARK" 2>/dev/null; then
         return 0
@@ -158,6 +167,43 @@ restore_rp_filter(){
         [ -f "$f" ] && cat "$saved" > "$f" 2>/dev/null
         rm -f "$saved"
     done
+}
+
+main_firewall_healthy(){
+    local lan_net
+
+    lan_net=$(get_lan_net)
+
+    iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
+    iptables -t mangle -C FORWARD -i "$IFACE" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
+    iptables -t mangle -C PREROUTING -j "$AWG_CHAIN" 2>/dev/null || return 1
+    iptables -t mangle -C "$AWG_CHAIN" -m addrtype \
+        --dst-type LOCAL -j RETURN 2>/dev/null || return 1
+    iptables -t nat -C POSTROUTING -m mark \
+        --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
+    if [ -n "$lan_net" ]; then
+        iptables -t nat -C POSTROUTING -s "$lan_net" \
+            -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
+    else
+        iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
+    fi
+    ipset list "$IPSET_NAME" >/dev/null 2>&1 || return 1
+    ip rule show 2>/dev/null | grep -q "fwmark $FWMARK.*lookup $RT_TABLE" || return 1
+    ip route show table $RT_TABLE 2>/dev/null | \
+        grep -q "^0.0.0.0/1 dev $IFACE" || return 1
+    ip route show table $RT_TABLE 2>/dev/null | \
+        grep -q "^128.0.0.0/1 dev $IFACE" || return 1
+
+    if [ -n "$lan_net" ]; then
+        ip route show table $RT_TABLE 2>/dev/null | \
+            grep -q "^$lan_net dev br0" || return 1
+    fi
+    return 0
 }
 
 # Wait for process to exit. Usage: wait_for_pid_exit <name> <timeout>
@@ -899,9 +945,7 @@ do_start(){
     gw=$(ip route | awk '/^default/{print $3; exit}')
     endpoint=$(get_endpoint)
     [ -n "$endpoint" ] && [ -n "$gw" ] && ip route add "$endpoint" via "$gw" 2>/dev/null
-    ip route add 0.0.0.0/1 dev "$IFACE" table $RT_TABLE 2>/dev/null
-    ip route add 128.0.0.0/1 dev "$IFACE" table $RT_TABLE 2>/dev/null
-    [ -n "$lan_net" ] && ip route add "$lan_net" dev br0 table $RT_TABLE 2>/dev/null
+    ensure_main_routes
 
     save_and_set_rp_filter
 
@@ -1198,8 +1242,17 @@ do_watchdog(){
         return $?
     fi
 
-    # Tunnel health alone is insufficient: firmware can reset rp_filter and
-    # awg0 recreation removes table 400.
+    # Rebuild only when a core table-300/firewall component is missing.
+    if ! main_firewall_healthy; then
+        log_msg "WATCHDOG: firewall or table 300 incomplete, repairing"
+        do_firewall_restart
+        if ! main_firewall_healthy; then
+            log_msg "ERROR: WATCHDOG firewall repair failed"
+            return 1
+        fi
+    fi
+
+    # Firmware can reset rp_filter and awg0 recreation removes table 400.
     save_and_set_rp_filter
     ensure_ui_mark_nat
     repair_aux_routing
@@ -1359,6 +1412,7 @@ do_firewall_restart(){
         fi
         setup_ipv6_block
         setup_firewall
+        ensure_main_routes
         local awg_addr
         awg_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
         [ -n "$awg_addr" ] && ip rule add from "$awg_addr" lookup $RT_TABLE prio 100
