@@ -31,6 +31,7 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 - **Incoming VPN client support** — mark-based NAT works for OpenVPN, IPsec, and other VPN-server interfaces
 - **Return-path protection** — the watchdog maintains loose `rp_filter` on `awg0` and incoming VPN interfaces
 - **Firewall monitoring** — the watchdog validates core rules, NAT, and table 300 and rebuilds them only when something is missing
+- **ipset monitoring** — the watchdog rebuilds `awg_dst` when it disappears or its static entry count falls below a safe threshold
 
 ## Requirements
 

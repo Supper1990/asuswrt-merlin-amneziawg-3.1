@@ -16,6 +16,7 @@ SETTINGS="/jffs/addons/custom_settings.txt"
 CLIENTS_FILE="$AWG_DIR/clients.list"
 GEO_DIR="$AWG_DIR/geo"
 IPSET_NAME="awg_dst"
+IPSET_MIN_COUNT_FILE="/tmp/.awg_ipset_min_count"
 FWMARK="0x100"
 DNSMASQ_AWG_CONF="$AWG_DIR/dnsmasq_awg.conf"
 DNSMASQ_INCLUDE="/jffs/configs/dnsmasq.conf.add"
@@ -170,7 +171,7 @@ restore_rp_filter(){
 }
 
 main_firewall_healthy(){
-    local lan_net
+    local lan_net min_ipset_count current_ipset_count
 
     lan_net=$(get_lan_net)
 
@@ -193,6 +194,13 @@ main_firewall_healthy(){
         iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     fi
     ipset list "$IPSET_NAME" >/dev/null 2>&1 || return 1
+    [ -f "$IPSET_MIN_COUNT_FILE" ] || return 1
+    min_ipset_count=$(cat "$IPSET_MIN_COUNT_FILE" 2>/dev/null)
+    case "$min_ipset_count" in ""|*[!0-9]*) return 1 ;; esac
+    current_ipset_count=$(ipset list "$IPSET_NAME" -t 2>/dev/null | \
+        awk '/Number of entries/{print $NF}')
+    [ -n "$current_ipset_count" ] || return 1
+    [ "$current_ipset_count" -ge "$min_ipset_count" ] 2>/dev/null || return 1
     ip rule show 2>/dev/null | grep -q "fwmark $FWMARK.*lookup $RT_TABLE" || return 1
     ip route show table $RT_TABLE 2>/dev/null | \
         grep -q "^0.0.0.0/1 dev $IFACE" || return 1
@@ -448,6 +456,7 @@ cleanup_firewall(){
     # Destroy ipset
     ipset flush "$IPSET_NAME" 2>/dev/null
     ipset destroy "$IPSET_NAME" 2>/dev/null
+    rm -f "$IPSET_MIN_COUNT_FILE"
 
     # Remove dnsmasq config
     rm -f "$DNSMASQ_AWG_CONF"
@@ -516,6 +525,20 @@ setup_firewall(){
             [ -n "$cidr" ] && ipset add "$IPSET_NAME" "$cidr" timeout 0 2>/dev/null
         done
     fi
+
+    # Save a conservative floor for static GeoIP/Custom IP entries. Dynamic
+    # DNS-derived entries may expire normally and are intentionally excluded
+    # from deciding whether an empty set is valid.
+    local min_ipset_count=0
+    if [ "$ip_count" -gt 0 ] 2>/dev/null || [ -n "$custom_ips" ]; then
+        ipset_entries=$(ipset list "$IPSET_NAME" -t 2>/dev/null | \
+            awk '/Number of entries/{print $NF}')
+        [ -n "$ipset_entries" ] || ipset_entries=0
+        min_ipset_count=$((ipset_entries * 9 / 10))
+        [ "$ipset_entries" -gt 0 ] 2>/dev/null && \
+            [ "$min_ipset_count" -lt 1 ] && min_ipset_count=1
+    fi
+    echo "$min_ipset_count" > "$IPSET_MIN_COUNT_FILE"
 
     # --- Build dnsmasq config for domain-based routing ---
     local domain_count=0
