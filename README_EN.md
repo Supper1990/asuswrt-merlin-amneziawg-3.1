@@ -150,6 +150,8 @@ GeoIP provides routing by IP addresses and CIDR networks.
 You can use predefined lists and add your own addresses and networks through **Custom IPs**.
 Only categories selected in **GeoIP Service Lists** are loaded into `awg_dst`. Clicking **Apply** removes deselected categories without requiring a separate list update, and the removal result is written to the log. GeoSite categories are parsed from the current `dlc.dat_plain.yml` format, and clearing GeoSite or Custom Domains no longer leaves stale rules behind.
 
+After settings are applied, GeoSite domain pre-resolution runs in the background. The web interface does not wait for every DNS request to finish; the start and completion of the `awg_dst` prefill are shown in the log.
+
 Example:
 
 ```text

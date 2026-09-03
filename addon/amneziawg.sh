@@ -20,6 +20,7 @@ IPSET_MIN_COUNT_FILE="/tmp/.awg_ipset_min_count"
 FWMARK="0x100"
 DNSMASQ_AWG_CONF="$AWG_DIR/dnsmasq_awg.conf"
 DNSMASQ_INCLUDE="/jffs/configs/dnsmasq.conf.add"
+DNS_PREFILL_LOCK="/tmp/.awg_dns_prefill"
 SCRIPT_NAME="amneziawg"
 RT_TABLE=300
 AWG_CHAIN="AWG"
@@ -275,6 +276,39 @@ restart_dnsmasq_and_wait(){
     done
     log_msg "WARNING: dnsmasq restart timeout"
     return 1
+}
+
+# Resolve configured domains after Apply without blocking the web request.
+# dnsmasq adds the resulting addresses to awg_dst. Only one prefill job is
+# allowed at a time; /tmp is cleared on reboot if a job is interrupted.
+pre_resolve_domains_async(){
+    [ -s "$DNSMASQ_AWG_CONF" ] || return 0
+
+    (
+        if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
+            log_msg "Domain pre-resolution already running"
+            exit 0
+        fi
+        trap 'rm -rf "$DNS_PREFILL_LOCK"' 0 1 2 15
+
+        local total bg_count domain_file
+        domain_file="$DNS_PREFILL_LOCK/domains"
+        awk -F/ '/^ipset=/{for(i=2;i<NF;i++) if($i!="") print $i}' \
+            "$DNSMASQ_AWG_CONF" > "$domain_file"
+        total=$(wc -l < "$domain_file" | tr -d ' ')
+        log_msg "Domain pre-resolution started: $total domains"
+
+        bg_count=0
+        while read -r domain; do
+            [ -z "$domain" ] && continue
+            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
+            bg_count=$((bg_count + 1))
+            [ "$bg_count" -ge 10 ] && { wait; bg_count=0; }
+        done < "$domain_file"
+        wait
+
+        log_msg "Domain pre-resolution finished: $total domains"
+    ) </dev/null >/dev/null 2>&1 &
 }
 
 # Wait for network interface IP. Usage: wait_for_iface_ip <iface> <timeout>
@@ -798,17 +832,6 @@ setup_firewall(){
     # --- Restart dnsmasq if geo active ---
     if [ $domain_count -gt 0 ] || [ "$has_geo" = true ]; then
         restart_dnsmasq_and_wait 15
-        # Pre-resolve domains to populate ipset
-        if [ -f "$DNSMASQ_AWG_CONF" ]; then
-            local bg_count=0
-            awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i}' "$DNSMASQ_AWG_CONF" | while read -r domain; do
-                [ -z "$domain" ] && continue
-                nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
-                bg_count=$((bg_count + 1))
-                [ $bg_count -ge 10 ] && { wait; bg_count=0; }
-            done
-            wait
-        fi
     fi
 
     # --- Always flush conntrack so devices reconnect through VPN ---
@@ -821,6 +844,10 @@ setup_firewall(){
     register_managed_cron
 
     log_msg "Firewall configured: $ip_count IPs, $domain_count domains"
+
+    # Populate dynamic domain addresses after the rules are active. Do not
+    # make Apply wait for hundreds of DNS queries or their timeouts.
+    [ "$domain_count" -gt 0 ] && pre_resolve_domains_async
 }
 
 save_clients(){
