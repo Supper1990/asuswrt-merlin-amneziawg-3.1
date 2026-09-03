@@ -356,15 +356,33 @@ selected_geoip_services(){
 }
 
 prune_unselected_geoip_lists(){
-    local selected_services="$1" old_file old_svc
+    local selected_services old_file file_name old_svc selected_svc keep
+    selected_services="$1"
     for old_file in "$GEO_DIR"/geoip/v2fly_*.cidr; do
         [ -f "$old_file" ] || continue
-        old_svc=${old_file##*/v2fly_}
+
+        # Extract the service from the basename in two simple steps.  This is
+        # reliable on the BusyBox ash used by Asuswrt-Merlin and avoids a
+        # pathname-pattern expansion that did not remove stale lists on some
+        # routers.
+        file_name=${old_file##*/}
+        old_svc=${file_name#v2fly_}
         old_svc=${old_svc%.cidr}
-        case " $selected_services " in
-            *" $old_svc "*) ;;
-            *) rm -f "$old_file" ;;
-        esac
+
+        keep=0
+        for selected_svc in $selected_services; do
+            if [ "$old_svc" = "$selected_svc" ]; then
+                keep=1
+                break
+            fi
+        done
+
+        [ "$keep" -eq 1 ] && continue
+        if rm -f "$old_file" && [ ! -e "$old_file" ]; then
+            log_msg "GeoIP: removed unselected $old_svc"
+        else
+            log_msg "WARNING: GeoIP failed to remove unselected $old_svc"
+        fi
     done
 }
 
@@ -825,9 +843,15 @@ geo_available(){
 }
 
 update_geo_if_needed(){
-    local svc
+    local svc selected_services
     mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains"
-    for svc in $(selected_geoip_services); do
+    selected_services=$(selected_geoip_services)
+
+    # Apply must be sufficient when a category is deselected.  Prune before
+    # downloading missing selections and before setup_firewall runs.
+    prune_unselected_geoip_lists "$selected_services"
+
+    for svc in $selected_services; do
         [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] && continue
         log_msg "GeoIP: downloading newly selected $svc..."
         download_geoip_service "$svc" || log_msg "WARNING: GeoIP $svc download failed"
