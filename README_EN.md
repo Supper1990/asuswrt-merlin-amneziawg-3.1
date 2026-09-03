@@ -37,29 +37,59 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 
 ## Installation
 
-Download the appropriate `.ipk` package from **Releases**.
+### Supported architecture
 
-Use the package matching your router architecture.
+The published `.ipk` is built for **64-bit ARM processors**:
 
-### 1. Copy the package to the router
+- CPU architecture: `ARM64` / `AArch64` (`uname -m` returns `aarch64`);
+- Entware package architecture: `aarch64-3.10`;
+- the package name ends with `_aarch64-3.10.ipk`.
+
+Check the router before installation:
+
+```sh
+uname -m
+/opt/bin/opkg print-architecture
+```
+
+This package is not supported if `uname -m` does not return `aarch64` or the Entware list does not contain `aarch64-3.10`.
+
+### Automatic installation from GitHub
+
+Connect to the router over SSH and run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Supper1990/asuswrt-merlin-amneziawg-3.1/main/install-online.sh -o /tmp/install-amneziawg.sh
+sh /tmp/install-amneziawg.sh
+```
+
+The installer checks the architecture, downloads the latest `.ipk` from **GitHub Releases**, verifies it against the published `SHA256SUMS`, and installs it through Entware.
+
+### Manual installation
+
+Download the `.ipk` package from **Releases**.
+
+Use the package with the `_aarch64-3.10.ipk` suffix.
+
+#### 1. Copy the package to the router
 
 ```sh
 scp amneziawg_*.ipk admin@<ROUTER-IP>:/tmp/
 ```
 
-### 2. Connect to the router via SSH
+#### 2. Connect to the router via SSH
 
 ```sh
 ssh admin@<ROUTER-IP>
 ```
 
-### 3. Install the package
+#### 3. Install the package
 
 ```sh
-opkg install /tmp/amneziawg_*.ipk
+/opt/bin/opkg install /tmp/amneziawg_*_aarch64-3.10.ipk
 ```
 
-### 4. Open the web interface
+### Open the web interface after installation
 
 After installation:
 

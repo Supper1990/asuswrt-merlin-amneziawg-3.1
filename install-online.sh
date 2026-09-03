@@ -1,111 +1,107 @@
 #!/bin/sh
-# =============================================================
-# AmneziaWG online installer for Asuswrt-Merlin
-# Usage: curl -sfL https://raw.githubusercontent.com/r0otx/asuswrt-merlin-amneziawg/main/install-online.sh | sh
-# =============================================================
+# AmneziaWG online installer for Asuswrt-Merlin ARM64.
 
-REPO="r0otx/asuswrt-merlin-amneziawg"
+REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
+SUPPORTED_ARCH="aarch64-3.10"
 TMP_DIR=""
 
-echo ""
+cleanup(){
+    [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+    rm -f /tmp/.awg_no_autostart
+}
+trap cleanup EXIT INT TERM
+
 echo "============================================"
 echo "  AmneziaWG Installer"
 echo "============================================"
-echo ""
 
-# Ensure /opt/bin is in PATH (not set in non-interactive curl|sh shells)
 export PATH="/opt/bin:/opt/sbin:$PATH"
 
-# Check Entware
 if [ ! -x /opt/bin/opkg ]; then
-    echo "ERROR: Entware not installed. Install it first via amtm."
+    echo "ERROR: Entware is not installed"
     exit 1
 fi
-echo "Entware: OK"
-
-# Detect architecture from opkg config (matches what opkg actually expects)
-PKG_ARCH=$(opkg print-architecture 2>/dev/null | awk '$1=="arch" && $2!="all" {print $2}' | head -1)
-if [ -z "$PKG_ARCH" ]; then
-    # Fallback to uname-based detection
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        aarch64) PKG_ARCH="aarch64-3.10" ;;
-        armv7l)  PKG_ARCH="armv7-2.6" ;;
-        *)
-            echo "ERROR: Unsupported architecture: $ARCH"
-            echo "Supported: aarch64, armv7l"
-            exit 1
-            ;;
-    esac
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl is not installed"
+    exit 1
 fi
-echo "Architecture: $PKG_ARCH"
 
-# Get latest release URL
+CPU_ARCH=$(uname -m)
+PKG_ARCH=$(/opt/bin/opkg print-architecture 2>/dev/null | \
+    awk -v wanted="$SUPPORTED_ARCH" '$1=="arch" && $2==wanted {print $2; exit}')
+
+echo "CPU architecture: $CPU_ARCH"
+echo "Entware architecture: ${PKG_ARCH:-not compatible}"
+
+if [ "$CPU_ARCH" != "aarch64" ] || [ "$PKG_ARCH" != "$SUPPORTED_ARCH" ]; then
+    echo "ERROR: This release supports only ARM64/AArch64 with Entware $SUPPORTED_ARCH"
+    exit 1
+fi
+
 echo "Fetching latest release..."
-RELEASE_JSON=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)
+RELEASE_JSON=$(curl -sfL --connect-timeout 10 --max-time 30 \
+    "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)
 if [ -z "$RELEASE_JSON" ]; then
-    echo "ERROR: Cannot reach GitHub API"
-    echo "Check DNS and internet connectivity: ping github.com"
+    echo "ERROR: Cannot reach the GitHub API"
     exit 1
 fi
 
-VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/^v//;s/".*//')
-# Validate version string
+VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | \
+    sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/^v//;s/".*//')
 case "$VERSION" in
-    "") echo "ERROR: Could not parse version"; exit 1 ;;
-    *[!0-9.]*) echo "ERROR: Invalid version format: $VERSION"; exit 1 ;;
+    ""|*[!0-9.-]*) echo "ERROR: Invalid release version: $VERSION"; exit 1 ;;
 esac
-echo "Latest version: $VERSION"
 
-# Find matching .ipk asset (exact arch, then fallback to base arch)
-IPK_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep "$PKG_ARCH" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//' | sed 's/".*//')
-if [ -z "$IPK_URL" ]; then
-    # Fallback: armv7-3.2 -> try armv7, aarch64-3.10 -> try aarch64
-    BASE_ARCH=$(echo "$PKG_ARCH" | sed 's/-.*//')
-    IPK_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep "${BASE_ARCH}" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//' | sed 's/".*//')
-fi
-if [ -z "$IPK_URL" ]; then
-    echo "ERROR: No .ipk found for $PKG_ARCH in release $VERSION"
-    exit 1
-fi
+IPK_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | \
+    grep "_${SUPPORTED_ARCH}\.ipk\"" | head -1 | \
+    sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
+SUMS_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | \
+    grep '/SHA256SUMS"' | head -1 | \
+    sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
 
-# Validate URL is from GitHub
 case "$IPK_URL" in
-    https://github.com/*) ;;
-    *) echo "ERROR: Unexpected download URL: $IPK_URL"; exit 1 ;;
+    https://github.com/${REPO}/releases/download/*) ;;
+    *) echo "ERROR: ARM64 package not found in release $VERSION"; exit 1 ;;
+esac
+case "$SUMS_URL" in
+    https://github.com/${REPO}/releases/download/*/SHA256SUMS) ;;
+    *) echo "ERROR: SHA256SUMS not found in release $VERSION"; exit 1 ;;
 esac
 
 IPK_FILE=$(basename "$IPK_URL")
+TMP_DIR=$(mktemp -d /tmp/amneziawg_install.XXXXXX) || exit 1
+
+echo "Latest version: $VERSION"
 echo "Package: $IPK_FILE"
+echo "Downloading package and SHA256SUMS..."
 
-# Download
-TMP_DIR=$(mktemp -d /tmp/amneziawg_install.XXXXXX) || { echo "ERROR: Cannot create temp directory"; exit 1; }
-trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
-echo "Downloading..."
-if ! curl -sfL --connect-timeout 10 --max-time 120 "$IPK_URL" -o "$TMP_DIR/$IPK_FILE"; then
-    echo "ERROR: Download failed"
-    rm -rf "$TMP_DIR"
+curl -sfL --connect-timeout 10 --max-time 180 \
+    "$IPK_URL" -o "$TMP_DIR/$IPK_FILE" || { echo "ERROR: Package download failed"; exit 1; }
+curl -sfL --connect-timeout 10 --max-time 60 \
+    "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" || { echo "ERROR: SHA256SUMS download failed"; exit 1; }
+
+EXPECTED=$(awk -v f="$IPK_FILE" '$2==f || $2=="*" f {print $1; exit}' "$TMP_DIR/SHA256SUMS")
+ACTUAL=$(sha256sum "$TMP_DIR/$IPK_FILE" 2>/dev/null | awk '{print $1}')
+if [ -z "$EXPECTED" ] || [ "$ACTUAL" != "$EXPECTED" ]; then
+    echo "ERROR: Package SHA256 mismatch"
     exit 1
 fi
-echo "Downloaded: $TMP_DIR/$IPK_FILE"
+echo "SHA256: OK"
 
-# Install
 echo "Installing..."
-opkg install "$TMP_DIR/$IPK_FILE" || opkg install --force-architecture "$TMP_DIR/$IPK_FILE"
+touch /tmp/.awg_no_autostart
+/opt/bin/opkg install "$TMP_DIR/$IPK_FILE" || \
+    /opt/bin/opkg install --force-architecture "$TMP_DIR/$IPK_FILE"
 RC=$?
+rm -f /tmp/.awg_no_autostart
 
-# Cleanup
-rm -rf "$TMP_DIR"
-
-if [ $RC -eq 0 ]; then
-    echo ""
-    echo "============================================"
-    echo "  AmneziaWG $VERSION installed!"
-    echo "============================================"
-    echo "  Web UI:  VPN > AmneziaWG"
-    echo "  Start:   /opt/etc/init.d/S99amneziawg start"
-    echo ""
-else
+if [ "$RC" -ne 0 ]; then
     echo "ERROR: Installation failed (exit code $RC)"
-    exit 1
+    exit "$RC"
 fi
+
+echo "============================================"
+echo "  AmneziaWG $VERSION installed"
+echo "============================================"
+echo "Web UI: VPN > AmneziaWG"
+echo "Start:  /opt/etc/init.d/S99amneziawg start"
