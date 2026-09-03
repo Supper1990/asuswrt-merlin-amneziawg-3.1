@@ -29,6 +29,7 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 - **Two independent routing lists** — the web UI uses `awg_dst`/table 300, while the AntiFilter list uses `MYAWG`/table 400
 - **Automatic route repair** — the watchdog restores table 400 after `awg0` is recreated, while cron updates the AntiFilter list daily
 - **Incoming VPN client support** — mark-based NAT works for OpenVPN, IPsec, and other VPN-server interfaces
+- **Return-path protection** — the watchdog maintains loose `rp_filter` on `awg0` and incoming VPN interfaces
 
 ## Requirements
 

@@ -130,22 +130,33 @@ flush_conntrack(){
 }
 
 save_and_set_rp_filter(){
-    for iface in all awg0 br0; do
-        local f="/proc/sys/net/ipv4/conf/$iface/rp_filter"
+    local f iface saved
+    for f in \
+        /proc/sys/net/ipv4/conf/all/rp_filter \
+        /proc/sys/net/ipv4/conf/awg0/rp_filter \
+        /proc/sys/net/ipv4/conf/br0/rp_filter \
+        /proc/sys/net/ipv4/conf/tun*/rp_filter \
+        /proc/sys/net/ipv4/conf/tap*/rp_filter \
+        /proc/sys/net/ipv4/conf/vti*/rp_filter \
+        /proc/sys/net/ipv4/conf/ipsec*/rp_filter; do
         [ -f "$f" ] || continue
-        cat "$f" > "/tmp/.awg_rp_$iface" 2>/dev/null
-        echo 2 > "$f" 2>/dev/null
+        iface=${f%/rp_filter}
+        iface=${iface##*/}
+        saved="/tmp/.awg_rp_$iface"
+        # Do not overwrite the original value during watchdog repairs.
+        [ -f "$saved" ] || cat "$f" > "$saved" 2>/dev/null
+        [ "$(cat "$f" 2>/dev/null)" = "2" ] || echo 2 > "$f" 2>/dev/null
     done
 }
 
 restore_rp_filter(){
-    for iface in all awg0 br0; do
-        local saved="/tmp/.awg_rp_$iface"
-        local f="/proc/sys/net/ipv4/conf/$iface/rp_filter"
-        if [ -f "$saved" ]; then
-            [ -f "$f" ] && cat "$saved" > "$f" 2>/dev/null
-            rm -f "$saved"
-        fi
+    local saved iface f
+    for saved in /tmp/.awg_rp_*; do
+        [ -f "$saved" ] || continue
+        iface=${saved##*/.awg_rp_}
+        f="/proc/sys/net/ipv4/conf/$iface/rp_filter"
+        [ -f "$f" ] && cat "$saved" > "$f" 2>/dev/null
+        rm -f "$saved"
     done
 }
 
@@ -619,6 +630,7 @@ setup_firewall(){
     flush_conntrack
 
     # Keep both independent routing systems healthy after every firewall rebuild.
+    save_and_set_rp_filter
     ensure_ui_mark_nat
     repair_aux_routing
     register_managed_cron
@@ -1186,7 +1198,9 @@ do_watchdog(){
         return $?
     fi
 
-    # Tunnel health alone is insufficient: awg0 recreation removes table 400.
+    # Tunnel health alone is insufficient: firmware can reset rp_filter and
+    # awg0 recreation removes table 400.
+    save_and_set_rp_filter
     ensure_ui_mark_nat
     repair_aux_routing
 }
