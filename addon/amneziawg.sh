@@ -66,6 +66,25 @@ repair_aux_routing(){
     }
 }
 
+ensure_ui_mark_nat(){
+    # Match the UI routing mark instead of a source subnet/interface. This
+    # covers LAN clients as well as OpenVPN, IPsec and other VPN-server clients.
+    iptables -t nat -C POSTROUTING \
+        -m mark --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING \
+        -m mark --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE
+}
+
+remove_ui_mark_nat(){
+    local _i=0
+    while [ $_i -lt 100 ] && iptables -t nat -C POSTROUTING \
+        -m mark --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null; do
+        iptables -t nat -D POSTROUTING \
+            -m mark --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null || break
+        _i=$((_i + 1))
+    done
+}
+
 disable_aux_routing(){
     [ -x "$AUX_IPSET_SCRIPT" ] && "$AUX_IPSET_SCRIPT" --disable 2>/dev/null
 }
@@ -600,6 +619,7 @@ setup_firewall(){
     flush_conntrack
 
     # Keep both independent routing systems healthy after every firewall rebuild.
+    ensure_ui_mark_nat
     repair_aux_routing
     register_managed_cron
 
@@ -815,6 +835,7 @@ do_start(){
 
     if is_running; then
         log_msg "Already running"
+        ensure_ui_mark_nat
         repair_aux_routing
         register_managed_cron
         update_status
@@ -937,6 +958,7 @@ do_stop(){
     iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null
 
     cleanup_firewall
+    remove_ui_mark_nat
     disable_aux_routing
 
     ip route flush table $RT_TABLE 2>/dev/null
@@ -1165,6 +1187,7 @@ do_watchdog(){
     fi
 
     # Tunnel health alone is insufficient: awg0 recreation removes table 400.
+    ensure_ui_mark_nat
     repair_aux_routing
 }
 
