@@ -17,7 +17,9 @@ CLIENTS_FILE="$AWG_DIR/clients.list"
 GEO_DIR="$AWG_DIR/geo"
 IPSET_NAME="awg_dst"
 IPSET_MIN_COUNT_FILE="/tmp/.awg_ipset_min_count"
+FIREWALL_EXPECTED="/tmp/.awg_firewall_expected"
 FWMARK="0x100"
+DIRECT_MARK="0x101"
 DNSMASQ_AWG_CONF="$AWG_DIR/dnsmasq_awg.conf"
 DNSMASQ_INCLUDE="/jffs/configs/dnsmasq.conf.add"
 DNS_PREFILL_LOCK="/tmp/.awg_dns_prefill"
@@ -224,6 +226,7 @@ main_firewall_healthy(){
         awk '/Number of entries/{print $NF}')
     [ -n "$current_ipset_count" ] || return 1
     [ "$current_ipset_count" -ge "$min_ipset_count" ] 2>/dev/null || return 1
+    ip rule show 2>/dev/null | grep -q "fwmark $DIRECT_MARK.*lookup main" || return 1
     ip rule show 2>/dev/null | grep -q "fwmark $FWMARK.*lookup $RT_TABLE" || return 1
     ip route show table $RT_TABLE 2>/dev/null | \
         grep -q "^0.0.0.0/1 dev $IFACE" || return 1
@@ -234,7 +237,19 @@ main_firewall_healthy(){
         ip route show table $RT_TABLE 2>/dev/null | \
             grep -q "^$lan_net dev br0" || return 1
     fi
+    [ -s "$FIREWALL_EXPECTED" ] || return 1
+    local actual_rules expected_rule
+    actual_rules=$(managed_firewall_rules)
+    while IFS= read -r expected_rule; do
+        printf '%s\n' "$actual_rules" | grep -qFx -- "$expected_rule" || return 1
+    done < "$FIREWALL_EXPECTED"
     return 0
+}
+
+managed_firewall_rules(){
+    iptables-save -t mangle 2>/dev/null | grep "^-A $AWG_CHAIN "
+    iptables-save -t nat 2>/dev/null | awk '/^-A PREROUTING / && /-i br0 / && /--dport 53 / && /-j DNAT/'
+    iptables-save -t filter 2>/dev/null | awk '/^-A FORWARD / && /-i br0 / && /--dport (443|853) / && /-j REJECT/'
 }
 
 # Wait for process to exit. Usage: wait_for_pid_exit <name> <timeout>
@@ -334,6 +349,7 @@ wait_for_iface(){
 }
 
 acquire_lock(){
+    [ "${DISPATCH_LOCK:-0}" = "1" ] && return 0
     local tries=0
     while ! mkdir "$LOCKDIR" 2>/dev/null; do
         if [ -f "$LOCKDIR/pid" ]; then
@@ -343,6 +359,8 @@ acquire_lock(){
                 rm -rf "$LOCKDIR"
                 continue
             fi
+        elif [ "$tries" -ge 2 ]; then
+            rmdir "$LOCKDIR" 2>/dev/null && continue
         fi
         tries=$((tries + 1))
         [ $tries -ge 30 ] && { log_msg "ERROR: lock timeout"; return 1; }
@@ -352,6 +370,7 @@ acquire_lock(){
 }
 
 release_lock(){
+    [ "${DISPATCH_LOCK:-0}" = "1" ] && return 0
     rm -rf "$LOCKDIR"
 }
 
@@ -444,7 +463,7 @@ download_all_geo(){
     # Download only GeoIP service lists selected in the web interface.
     local selected_services
     selected_services=$(selected_geoip_services)
-    local count=0 total=0 ok=0
+    local count=0 total=0 ok=0 geo_failed=0
     for svc in $selected_services; do
         total=$((total + 1))
     done
@@ -454,6 +473,7 @@ download_all_geo(){
         if download_geoip_service "$svc"; then
             ok=$((ok + 1))
         else
+            geo_failed=1
             log_msg "WARNING: GeoIP $svc failed"
         fi
         update_status
@@ -479,17 +499,23 @@ download_all_geo(){
             log_msg "GeoSite: $(wc -l < "$GEO_DIR/v2fly_categories.txt") categories downloaded"
         else
             rm -f "$tmp_yml"
+            geo_failed=1
             log_msg "WARNING: v2fly domain download empty"
         fi
     else
         rm -f "$tmp_yml"
+        geo_failed=1
         log_msg "WARNING: v2fly domain download failed"
     fi
 
-    # Save timestamp
-    date +%s > "$GEO_DIR/.last_update"
+    if [ "$geo_failed" -eq 0 ]; then
+        date +%s > "$GEO_DIR/.last_update"
+        log_msg "Geo databases updated"
+    else
+        log_msg "WARNING: Geo update incomplete; last successful timestamp preserved"
+    fi
     update_status
-    log_msg "Geo databases updated"
+    [ "$geo_failed" -eq 0 ]
 }
 
 # Mount AmneziaWG tab into Merlin menu
@@ -538,7 +564,7 @@ setup_ipv6_block(){
     [ "$ipv6_svc" = "disabled" ] || [ -z "$ipv6_svc" ] && return 0
     ip6tables -I FORWARD -i br0 -o "$IFACE" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null
     ip6tables -I FORWARD -i "$IFACE" -o br0 -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null
-    log_msg "IPv6 leak protection enabled"
+    log_msg "WARNING: IPv6 routing is not managed; native WAN IPv6 may bypass AmneziaWG"
 }
 
 cleanup_ipv6_block(){
@@ -551,6 +577,16 @@ cleanup_firewall(){
     iptables -t mangle -D PREROUTING -j "$AWG_CHAIN" 2>/dev/null
     iptables -t mangle -F "$AWG_CHAIN" 2>/dev/null
     iptables -t mangle -X "$AWG_CHAIN" 2>/dev/null
+
+    # Remove our direct override and legacy source-only direct rules.
+    while ip rule del fwmark "$DIRECT_MARK" lookup main prio 9 2>/dev/null; do :; done
+    if [ -s "$CLIENTS_FILE" ]; then
+        local old_dev old_name old_policy old_mac
+        while IFS=',' read -r old_dev old_name old_policy old_mac; do
+            [ "$old_policy" = "direct" ] && [ -z "$old_mac" ] || continue
+            while ip rule del from "$old_dev" lookup main prio 97 2>/dev/null; do :; done
+        done < "$CLIENTS_FILE"
+    fi
 
     # Remove all ip rules for our table/fwmark
     local _i=0; while [ $_i -lt 100 ] && ip rule del lookup $RT_TABLE 2>/dev/null; do _i=$((_i+1)); done
@@ -749,16 +785,14 @@ setup_firewall(){
             [ -z "$dev_id" ] && continue
             [ "$policy" != "direct" ] && continue
 
-            if [ "$default_policy" != "direct" ]; then
-                if [ -n "$mac" ]; then
-                    iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j RETURN
-                else
-                    ip rule add from "$dev_id" lookup main prio 97
-                fi
-                log_msg "Route: $dev_id ($name) -> Direct (excluded)"
+            if [ -n "$mac" ]; then
+                iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j MARK --set-mark "$DIRECT_MARK"
+                iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j RETURN
             else
-                log_msg "Route: $dev_id ($name) -> Direct"
+                iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" -j MARK --set-mark "$DIRECT_MARK"
+                iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" -j RETURN
             fi
+            log_msg "Route: $dev_id ($name) -> Direct (including AntiFilter bypass)"
         done < "$CLIENTS_FILE"
 
         # Pass 2: vpn_all and vpn_geo rules
@@ -773,7 +807,12 @@ setup_firewall(){
                     if [ -n "$mac" ]; then
                         iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j MARK --set-mark "$FWMARK"
                     else
-                        ip rule add from "$dev_id" lookup $RT_TABLE prio 99
+                        iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" -j MARK --set-mark "$FWMARK"
+                    fi
+                    if [ -n "$mac" ]; then
+                        iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j RETURN
+                    else
+                        iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" -j RETURN
                     fi
                     log_msg "Route: $dev_id ($name) -> VPN (all)"
                     ;;
@@ -785,6 +824,11 @@ setup_firewall(){
                         else
                             iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" \
                                 -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK"
+                        fi
+                        if [ -n "$mac" ]; then
+                            iptables -t mangle -A "$AWG_CHAIN" -m mac --mac-source "$mac" -j RETURN
+                        else
+                            iptables -t mangle -A "$AWG_CHAIN" -s "$dev_id" -j RETURN
                         fi
                         has_geo=true
                         log_msg "Route: $dev_id ($name) -> VPN (geo)"
@@ -822,6 +866,7 @@ setup_firewall(){
         iptables -t mangle -A PREROUTING -j "$AWG_CHAIN"
 
     # --- Single fwmark rule for all marked traffic ---
+    ip rule add fwmark "$DIRECT_MARK" lookup main prio 9
     ip rule add fwmark "$FWMARK" lookup $RT_TABLE prio 98
 
     # --- Force DNS through dnsmasq whenever VPN is active ---
@@ -840,9 +885,13 @@ setup_firewall(){
     # Keep both independent routing systems healthy after every firewall rebuild.
     save_and_set_rp_filter
     ensure_ui_mark_nat
+    local source_addr
+    source_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+    [ -n "$source_addr" ] && ip rule add from "$source_addr" lookup $RT_TABLE prio 100
     repair_aux_routing
     register_managed_cron
 
+    managed_firewall_rules > "$FIREWALL_EXPECTED"
     log_msg "Firewall configured: $ip_count IPs, $domain_count domains"
 
     # Populate dynamic domain addresses after the rules are active. Do not
@@ -1148,11 +1197,6 @@ do_start(){
 
     setup_firewall
 
-    # Route for router-originated traffic (after setup_firewall which cleans ip rules)
-    local awg_addr
-    awg_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
-    [ -n "$awg_addr" ] && ip rule add from "$awg_addr" lookup $RT_TABLE prio 100
-
     log_msg "Started, verifying tunnel connectivity..."
     update_status
     release_lock
@@ -1185,6 +1229,9 @@ do_stop(){
     acquire_lock || { log_msg "Cannot acquire lock, aborting stop"; return 1; }
 
     remove_managed_cron
+    if [ "${WATCHDOG_RECOVERY:-0}" = "1" ]; then
+        cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+    fi
 
     iptables -D INPUT -i "$IFACE" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null
@@ -1412,24 +1459,28 @@ do_uninstall(){
 # --- Watchdog (called by cron every 5 min) ---
 
 do_watchdog(){
-    # Skip if lock held (another operation in progress)
-    [ -d "$LOCKDIR" ] && return 0
+    # The dispatcher serializes watchdog with Apply, start and firewall hooks.
 
     local reason=""
     if ! ip link show "$IFACE" >/dev/null 2>&1; then
         reason="interface $IFACE missing"
     elif ! pidof amneziawg-go >/dev/null 2>&1; then
         reason="amneziawg-go process dead"
-    elif ! ping -c 1 -W 5 -I "$IFACE" 8.8.8.8 >/dev/null 2>&1; then
+    elif ! tunnel_healthy; then
         reason="tunnel not passing traffic"
     fi
 
     if [ -n "$reason" ]; then
         log_msg "WATCHDOG: $reason, restarting"
+        WATCHDOG_RECOVERY=1
         do_stop 2>/dev/null
         wait_for_pid_exit amneziawg-go 10
         do_start
-        return $?
+        local restart_result=$?
+        # Even an early startup failure must leave another recovery attempt.
+        cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+        WATCHDOG_RECOVERY=0
+        return "$restart_result"
     fi
 
     # Rebuild only when a core table-300/firewall component is missing.
@@ -1603,9 +1654,6 @@ do_firewall_restart(){
         setup_ipv6_block
         setup_firewall
         ensure_main_routes
-        local awg_addr
-        awg_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
-        [ -n "$awg_addr" ] && ip rule add from "$awg_addr" lookup $RT_TABLE prio 100
     fi
 }
 
@@ -1619,8 +1667,17 @@ do_service_event(){
         awgrestart)     do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
         awgsaveconf)
             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(get_setting awg_privatekey)" ]; do sleep 1; _wt=$((_wt+1)); done
-            generate_config
+            local old_config new_config
+            old_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
+            generate_config || return 1
+            new_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
             update_geo_if_needed
+            if is_running && [ "$old_config" != "$new_config" ]; then
+                log_msg "Tunnel settings changed; restarting"
+                do_stop
+                do_start
+                return $?
+            fi
             if is_running; then
                 setup_firewall
             elif ! antifilter_enabled; then
@@ -1647,7 +1704,32 @@ do_service_event(){
     esac
 }
 
+tunnel_healthy(){
+    local attempt=0 target
+    while [ "$attempt" -lt 3 ]; do
+        for target in 8.8.8.8 1.1.1.1; do
+            ping -c 1 -W 3 -I "$IFACE" "$target" >/dev/null 2>&1 && return 0
+        done
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 # --- Main ---
+
+# Serialize runtime changes. Package upgrades manage stop/install separately
+# because opkg invokes this script again from its installation hooks.
+operation="$1"
+[ "$1" = "service_event" ] && operation="$3"
+case "$operation" in
+    status|check_update|awgcheckupdate|update|awgdoupdate) ;;
+    *)
+        acquire_lock || exit 1
+        DISPATCH_LOCK=1
+        trap 'rm -rf "$LOCKDIR"' 0
+        trap 'exit 1' 1 2 15
+        ;;
+esac
 
 case "$1" in
     start)          do_start ;;

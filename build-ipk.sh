@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-16"
+PKG_VERSION="2.2.0-17"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)

@@ -30,12 +30,9 @@ LM_FILE="$BASE/last_modified"
 HASH_FILE="$BASE/hash"
 OLD_LIST="$BASE/current.lst"
 NEW_LIST="$BASE/new.lst"
-ADD_LIST="/tmp/myawg_add.lst"
-DEL_LIST="/tmp/myawg_del.lst"
 
 HASH_SIZE="262144"
 MAX_ELEM="2000000"
-INCREMENT_LIMIT="5000"
 MIN_NETS="1000"
 
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -119,6 +116,7 @@ attach_chain_after_awg(){
 }
 
 ensure_routing(){
+    antifilter_allowed || { disable_routing; return 1; }
     ip link show "$IFACE" >/dev/null 2>&1 || {
         log "ERROR: interface $IFACE not found"
         return 1
@@ -133,6 +131,10 @@ ensure_routing(){
     ip route flush cache 2>/dev/null
 
     iptables -t mangle -N "$CHAIN" 2>/dev/null
+    # Explicit Direct devices must bypass AntiFilter, including VPN clients.
+    if ! iptables -t mangle -C "$CHAIN" -m mark --mark 0x101/0xffffffff -j RETURN 2>/dev/null; then
+        iptables -t mangle -I "$CHAIN" 1 -m mark --mark 0x101/0xffffffff -j RETURN
+    fi
 
     lan_net=$(get_lan_net)
     endpoint_ip=$(get_endpoint_ip 2>/dev/null)
@@ -201,9 +203,15 @@ full_rebuild_from_new_list(){
         ipset destroy "$TMP_SET" 2>/dev/null
         return 1
     fi
-    ipset swap "$TMP_SET" "$SET"
+    if ! ipset swap "$TMP_SET" "$SET"; then
+        log "ERROR: ipset swap failed; cache unchanged"
+        return 1
+    fi
     ipset destroy "$TMP_SET" 2>/dev/null
-    cp "$NEW_LIST" "$OLD_LIST"
+    if ! cp "$NEW_LIST" "$OLD_LIST.tmp" || ! mv "$OLD_LIST.tmp" "$OLD_LIST"; then
+        log "ERROR: cannot commit AntiFilter cache"
+        return 1
+    fi
     log "Full rebuild done"
 }
 
@@ -217,18 +225,6 @@ restore_from_cache_if_needed(){
     full_rebuild_from_new_list
 }
 
-incremental_update(){
-    log "Incremental update started"
-    while IFS= read -r net; do
-        [ -n "$net" ] && ipset add "$SET" "$net" -exist 2>>"$LOG"
-    done < "$ADD_LIST"
-    while IFS= read -r net; do
-        [ -n "$net" ] && ipset del "$SET" "$net" 2>/dev/null
-    done < "$DEL_LIST"
-    cp "$NEW_LIST" "$OLD_LIST"
-    log "Incremental update done"
-}
-
 repair_runtime(){
     was_active=false
     routing_is_active && was_active=true
@@ -238,19 +234,13 @@ repair_runtime(){
         update_list
         return $?
     fi
-    ensure_routing
+    ensure_routing || return 1
     if [ "$was_active" != true ]; then
         log "AntiFilter enabled; routing active with $(ipset_count) entries"
     fi
 }
 
 update_list(){
-    if ! mkdir "$LOCKDIR" 2>/dev/null; then
-        log "Update already running"
-        return 0
-    fi
-    trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
-
     log "===== UPDATE START ====="
     ip link show "$IFACE" >/dev/null 2>&1 || {
         log "ERROR: interface $IFACE not found"
@@ -268,6 +258,8 @@ update_list(){
         echo "location"
         echo "show-error"
         echo "connect-timeout = 15"
+        echo "max-time = 60"
+        echo "retry-max-time = 180"
         echo "retry = 3"
         echo "dump-header = \"$HDR\""
         echo "output = \"$TMP\""
@@ -284,8 +276,8 @@ update_list(){
     http_code=$(curl -K "$CURL_CONF" -w "%{http_code}" "$URL" 2>>"$LOG")
     if [ "$http_code" = "304" ]; then
         log "AntiFilter list not modified"
-        restore_from_cache_if_needed || true
-        ensure_routing
+        restore_from_cache_if_needed || return 1
+        ensure_routing || return 1
         log "===== UPDATE DONE ====="
         return 0
     fi
@@ -312,47 +304,66 @@ update_list(){
     new_etag=$(grep -i '^ETag:' "$HDR" | tail -n 1 | sed 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//' | tr -d '\r')
     new_modified=$(grep -i '^Last-Modified:' "$HDR" | tail -n 1 | \
         sed 's/^[Ll][Aa][Ss][Tt]-[Mm][Oo][Dd][Ii][Ff][Ii][Ee][Dd]:[[:space:]]*//' | tr -d '\r')
-    [ -n "$new_etag" ] && echo "$new_etag" > "$ETAG_FILE"
-    [ -n "$new_modified" ] && echo "$new_modified" > "$LM_FILE"
 
     if [ "$new_hash" = "$old_hash" ]; then
         log "AntiFilter list unchanged"
-        restore_from_cache_if_needed || true
-        ensure_routing
+        restore_from_cache_if_needed || return 1
+        ensure_routing || return 1
         log "===== UPDATE DONE ====="
         return 0
     fi
 
-    if [ ! -s "$OLD_LIST" ]; then
-        if full_rebuild_from_new_list; then
-            echo "$new_hash" > "$HASH_FILE"
-        else
-            ensure_routing
-            return 1
-        fi
-    else
-        sort -u "$OLD_LIST" -o "$OLD_LIST"
-        sort -u "$NEW_LIST" -o "$NEW_LIST"
-        comm -13 "$OLD_LIST" "$NEW_LIST" > "$ADD_LIST"
-        comm -23 "$OLD_LIST" "$NEW_LIST" > "$DEL_LIST"
-        add_count=$(wc -l < "$ADD_LIST" | tr -d ' ')
-        del_count=$(wc -l < "$DEL_LIST" | tr -d ' ')
-        log "Changes: add=$add_count del=$del_count"
-        if [ "$add_count" -le "$INCREMENT_LIMIT" ] && [ "$del_count" -le "$INCREMENT_LIMIT" ]; then
-            incremental_update
-            echo "$new_hash" > "$HASH_FILE"
-        elif full_rebuild_from_new_list; then
-            echo "$new_hash" > "$HASH_FILE"
-        else
-            ensure_routing
-            return 1
-        fi
+    # Stage the complete changed list: failures never commit a partial live set.
+    if ! full_rebuild_from_new_list; then
+        log "ERROR: AntiFilter update not committed"
+        return 1
     fi
+    echo "$new_hash" > "$HASH_FILE.tmp" && mv "$HASH_FILE.tmp" "$HASH_FILE" || return 1
+    [ -n "$new_etag" ] && printf '%s\n' "$new_etag" > "$ETAG_FILE"
+    [ -n "$new_modified" ] && printf '%s\n' "$new_modified" > "$LM_FILE"
 
-    ensure_routing
+    ensure_routing || return 1
     log "AntiFilter list updated: $(ipset_count) entries"
     log "===== UPDATE DONE ====="
 }
+
+antifilter_allowed(){
+    [ "$(awk '$1=="awg_antifilter_enabled" {print $2; exit}' /jffs/addons/custom_settings.txt 2>/dev/null)" != "0" ]
+}
+
+acquire_aux_lock(){
+    local tries=0 old_pid
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        if [ -s "$LOCKDIR/pid" ]; then
+            old_pid=$(cat "$LOCKDIR/pid")
+            case "$old_pid" in
+                ''|*[!0-9]*) log "ERROR: invalid lock owner"; return 1 ;;
+            esac
+            if ! kill -0 "$old_pid" 2>/dev/null; then
+                rm -rf "$LOCKDIR"
+                continue
+            fi
+        elif [ "$tries" -ge 2 ]; then
+            rmdir "$LOCKDIR" 2>/dev/null && continue
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 240 ] && { log "ERROR: AntiFilter lock timeout"; return 1; }
+        sleep 1
+    done
+    echo $$ > "$LOCKDIR/pid"
+}
+
+acquire_aux_lock || exit 1
+trap 'rm -rf "$LOCKDIR"' 0
+trap 'exit 1' 1 2 15
+case "${1:---update}" in
+    --repair|--update)
+        if ! antifilter_allowed; then
+            disable_routing
+            exit 0
+        fi
+        ;;
+esac
 
 case "${1:---update}" in
     --repair)  repair_runtime ;;

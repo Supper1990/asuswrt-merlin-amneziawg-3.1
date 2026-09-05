@@ -264,3 +264,16 @@ The project author is not responsible for use of the software in violation of ap
 ## License
 
 MIT License
+
+### Recovery fixes in 2.2.0-17
+
+- Watchdog retains its cron retry after failed recovery, probes two addresses up to three times, and recovers stale PID locks.
+- Apply, startup and firewall hooks are serialized. Apply restarts the tunnel when its configuration changes; routing-only edits rebuild the rules.
+- Watchdog checks captured AWG and DNS interception rules, including device rules.
+- Explicit device Direct policy bypasses AntiFilter using mark 0x101 and priority 9 lookup main. Individual Geo policy is no longer overridden by the global full-tunnel policy. Tables 300 and 400 remain separate.
+- AntiFilter serializes update/repair/disable and checks the setting before activation. Changed lists are staged in a temporary ipset and swapped; ipset failures do not commit cache/hash. Staged replacement supersedes incremental updates; unchanged healthy sets are retained.
+- Failed Geo downloads preserve the last successful update timestamp.
+
+Limitations: routing is IPv4-only; native IPv6 WAN traffic is not blocked. A warning replaces the misleading protection message. Rule-presence checks do not guarantee absence of conflicting third-party rules.
+
+Offline checks: `python3 tests/test_recovery.py` (mock system commands; router validation is still required).
