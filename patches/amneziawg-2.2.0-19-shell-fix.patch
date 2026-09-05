@@ -1,0 +1,175 @@
+diff --git a/README.md b/README.md
+index 3ef290e..d7b1e3a 100644
+--- a/README.md
++++ b/README.md
+@@ -283,3 +283,7 @@ MIT License
+ Проверка списков до применения, восстановление при ошибках, полный контроль состава AntiFilter, квитанции операций в интерфейсе, живой статус, сохранение MAC, единый автозапуск и обновление пакета с проверенным пакетом отката. Поле DNS применяется к выбранным доменам. Общая таблица соединений больше не очищается.
+ 
+ Проверки, ограничения GeoSite/IPv6 и порядок приёмки: [docs/AUDIT-18.md](docs/AUDIT-18.md). Перед упаковкой выполняется `bash tests/run.sh` (Python 3; браузерный тест дополнительно использует Node.js). Побитовая воспроизводимость Docker-сборки не гарантируется.
++
++### Исправление запуска 2.2.0-19
++
++На роутере при старте 2.2.0-18 зафиксировано `command: not found` из обёртки firewall. Теперь `ip` и `iptables` предварительно находятся в PATH и запускаются по абсолютному пути. Проверка обязательных ошибок сохранена; добавлены сообщения о сбое команды и тесты оболочки без `command`.
+diff --git a/README_EN.md b/README_EN.md
+index 51fcc5e..9507fef 100644
+--- a/README_EN.md
++++ b/README_EN.md
+@@ -283,3 +283,7 @@ Offline checks: `python3 tests/test_recovery.py` (mock system commands; router v
+ List validation before application, rollback on detected runtime errors, complete AntiFilter membership checks, operation receipts in the UI, live status, MAC preservation, consistent autostart and package updates with a verified rollback package. The DNS field applies to selected domains. The global connection table is no longer flushed.
+ 
+ See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitations and router acceptance checks. Packaging runs `bash tests/run.sh` (Python 3; the browser test also uses Node.js). Docker builds are not guaranteed to be byte-for-byte reproducible.
++
++### Startup fix in 2.2.0-19
++
++A router running 2.2.0-18 reported `command: not found` from the firewall wrapper. The addon now resolves external `ip` and `iptables` executables from PATH before wrapping them and invokes their absolute paths. Required-operation failure checks remain active; command failure messages and regression tests without `command` are included.
+diff --git a/addon/awg-runtime.sh b/addon/awg-runtime.sh
+index 409b784..a614771 100644
+--- a/addon/awg-runtime.sh
++++ b/addon/awg-runtime.sh
+@@ -73,10 +73,30 @@ preflight_geo(){
+     done
+ }
+ 
++# Some Merlin BusyBox shells omit the `command` builtin. Resolve the external
++# programs before defining same-name wrappers; never recurse into a wrapper.
++find_external_program(){
++    local name="$1" remaining="$PATH" dir
++    case "$name" in ''|*/*) return 1;; esac
++    while :; do
++        dir=${remaining%%:*}
++        [ -n "$dir" ] || dir=.
++        case "$dir" in /*) ;; *) dir="$PWD/$dir";; esac
++        if [ -f "$dir/$name" ] && [ -x "$dir/$name" ]; then
++            printf '%s\n' "$dir/$name"
++            return 0
++        fi
++        case "$remaining" in *:*) remaining=${remaining#*:};; *) break;; esac
++    done
++    return 1
++}
++
+ setup_firewall(){
+     validate_runtime_settings || return 1
+     cancel_prefill || return 1
+-    local txn original_geo had_set=0 rc
++    local txn original_geo had_set=0 rc awg_ip_exec awg_iptables_exec
++    awg_ip_exec=$(find_external_program ip) || { log_msg 'ERROR: ip executable not found'; return 1; }
++    awg_iptables_exec=$(find_external_program iptables) || { log_msg 'ERROR: iptables executable not found'; return 1; }
+     txn=$(mktemp -d /tmp/awg_apply.XXXXXX) || return 1
+     original_geo="$GEO_DIR"
+     mkdir -p "$txn/geo/geoip" "$txn/geo/domains"
+@@ -102,17 +122,19 @@ setup_firewall(){
+         # Expected absence checks/deletions may fail; creation of required
+         # rules, addresses and routes must not be converted into success.
+         iptables(){
+-            command iptables "$@"; code=$?
+-            case " $* " in *' -A '*|*' -I '*) [ "$code" = 0 ] || exit 42;; esac
++            local code
++            "$awg_iptables_exec" "$@"; code=$?
++            case " $* " in *' -A '*|*' -I '*) [ "$code" = 0 ] || { log_msg "ERROR: iptables rule failed (exit $code): $*"; exit 42; };; esac
+             return "$code"
+         }
+         ip(){
+-            command ip "$@"; code=$?
+-            case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || exit 42;; esac
++            local code
++            "$awg_ip_exec" "$@"; code=$?
++            case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || { log_msg "ERROR: ip operation failed (exit $code): $*"; exit 42; };; esac
+             return "$code"
+         }
+-        setup_firewall_body || exit 1
+-        main_firewall_base_healthy || exit 1
++        setup_firewall_body || { log_msg 'ERROR: firewall setup did not complete'; exit 1; }
++        main_firewall_base_healthy || { log_msg 'ERROR: firewall verification did not pass'; exit 1; }
+     )
+     rc=$?
+     if [ "$rc" != 0 ]; then
+diff --git a/build-ipk.sh b/build-ipk.sh
+index 399baa0..cee5467 100755
+--- a/build-ipk.sh
++++ b/build-ipk.sh
+@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
+ bash tests/run.sh
+ 
+ PKG_NAME="amneziawg"
+-PKG_VERSION="2.2.0-18"
++PKG_VERSION="2.2.0-19"
+ 
+ AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
+ AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
+diff --git a/tests/test_audit.py b/tests/test_audit.py
+index bd0210b..72a1ba7 100644
+--- a/tests/test_audit.py
++++ b/tests/test_audit.py
+@@ -125,6 +125,7 @@ operation_write 123 succeeded Apply
+                  'IPSET_MIN_COUNT_FILE':d+'/min','FIREWALL_EXPECTED':d+'/expected','TRACE':d+'/trace'}
+             result=self.shell(functions(RUNTIME,'setup_firewall').replace('iptables-save','iptables_save')+'''
+ validate_runtime_settings(){ :; }
++find_external_program(){ echo /bin/true; }
+ cancel_prefill(){ :; }
+ preflight_geo(){ :; }
+ prune_unselected_geoip_lists(){ :; }
+diff --git a/tests/test_merlin_shell.py b/tests/test_merlin_shell.py
+new file mode 100644
+index 0000000..00d45bc
+--- /dev/null
++++ b/tests/test_merlin_shell.py
+@@ -0,0 +1,58 @@
++"""Regression: Merlin shell reported `command: not found` during Start."""
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++import textwrap
++import unittest
++from test_recovery import functions, ROOT
++
++RUNTIME=(ROOT/'addon/awg-runtime.sh').read_text()
++
++class MerlinShell(unittest.TestCase):
++    def run_shell(self, script, env):
++        return subprocess.run(['/bin/sh'], input=script, text=True, capture_output=True,
++                              timeout=10, env=dict(os.environ, **env))
++
++    def test_path_resolution_ignores_same_name_function(self):
++        with tempfile.TemporaryDirectory() as d:
++            exe=Path(d,'ip');exe.write_text('#!/bin/sh\necho external\n');exe.chmod(0o755)
++            result=self.run_shell(functions(RUNTIME,'find_external_program')+'''
++command(){ echo 'command unavailable' >&2; return 127; }
++ip(){ echo RECURSION; return 1; }
++resolved=$(find_external_program ip) || exit 1
++"$resolved"
++''',{'PATH':d})
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertEqual(result.stdout,'external\n')
++
++    def test_missing_executable_is_reported(self):
++        with tempfile.TemporaryDirectory() as d:
++            result=self.run_shell(functions(RUNTIME,'find_external_program')+'\nfind_external_program ip',{'PATH':d})
++            self.assertEqual(result.returncode,1)
++
++    def test_wrappers_run_without_command_and_keep_error_checks(self):
++        wrappers='\n'.join(textwrap.dedent(re.search(r'^        '+name+r'\(\)\{.*?^        \}',RUNTIME,re.M|re.S).group()) for name in ('ip','iptables'))
++        for mode,expected in [('success',0),('probe',1),('fail_route',42),('fail_rule',42)]:
++            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as d:
++                for name in ('ip','iptables'):
++                    exe=Path(d,name)
++                    exe.write_text('#!/bin/sh\necho "'+name+' $*" >> "$TRACE"\n[ "$MODE" = success ]\n')
++                    exe.chmod(0o755)
++                calls={'success':'ip route replace default dev awg0; iptables -t mangle -A AWG -j RETURN',
++                       'probe':'iptables -t mangle -C AWG -j RETURN',
++                       'fail_route':'ip route replace default dev awg0',
++                       'fail_rule':'iptables -t mangle -A AWG -j RETURN'}
++                result=self.run_shell(functions(RUNTIME,'find_external_program')+'''
++command(){ echo 'command unavailable' >&2; return 127; }
++log_msg(){ printf '%s\n' "$*" >&2; }
++awg_ip_exec=$(find_external_program ip) || exit 2
++awg_iptables_exec=$(find_external_program iptables) || exit 2
++'''+wrappers+'\n'+calls[mode],{'PATH':d,'TRACE':d+'/trace','MODE':mode})
++                self.assertEqual(result.returncode,expected,result.stderr)
++                self.assertNotIn('command unavailable',result.stderr)
++                self.assertTrue(Path(d,'trace').exists())
++                if expected==42:self.assertIn('ERROR:',result.stderr)
++
++if __name__=='__main__':unittest.main()
