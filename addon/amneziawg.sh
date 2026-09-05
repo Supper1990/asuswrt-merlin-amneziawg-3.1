@@ -34,7 +34,13 @@ V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/t
 # Ensure Entware binaries are in PATH (not set when called from httpd/service-event)
 export PATH="/opt/bin:/opt/sbin:$PATH"
 
+. "${AWG_COMMON_PATH:-$ADDON_DIR/awg-common.sh}" || exit 1
+
 # --- Helpers ---
+
+autostart_enabled(){
+    [ "$(get_setting awg_autostart)" != "0" ]
+}
 
 log_msg(){
     logger -t "$SCRIPT_NAME" "$1"
@@ -72,7 +78,7 @@ repair_aux_routing(){
     [ -x "$AUX_IPSET_SCRIPT" ] || return 0
     if ! antifilter_enabled; then
         "$AUX_IPSET_SCRIPT" --disable 2>/dev/null
-        return 0
+        return $?
     fi
     "$AUX_IPSET_SCRIPT" --repair || {
         log_msg "WARNING: MYAWG table 400 repair failed"
@@ -151,17 +157,16 @@ get_endpoint(){
 ensure_main_routes(){
     local lan_net
     lan_net=$(get_lan_net)
-    ip route replace 0.0.0.0/1 dev "$IFACE" table $RT_TABLE
-    ip route replace 128.0.0.0/1 dev "$IFACE" table $RT_TABLE
-    [ -n "$lan_net" ] && ip route replace "$lan_net" dev br0 table $RT_TABLE
+    ip route replace 0.0.0.0/1 dev "$IFACE" table $RT_TABLE || return 1
+    ip route replace 128.0.0.0/1 dev "$IFACE" table $RT_TABLE || return 1
+    if [ -n "$lan_net" ]; then ip route replace "$lan_net" dev br0 table $RT_TABLE || return 1; fi
     ip route flush cache 2>/dev/null
 }
 
 flush_conntrack(){
-    if command -v conntrack >/dev/null 2>&1 && conntrack -D --mark "$FWMARK"/"$FWMARK" 2>/dev/null; then
-        return 0
-    fi
-    conntrack -F 2>/dev/null
+    # Never clear the router-wide connection table. Packet marks are not
+    # connection marks; deleting by our packet mark is not a safe selector.
+    return 0
 }
 
 save_and_set_rp_filter(){
@@ -195,7 +200,7 @@ restore_rp_filter(){
     done
 }
 
-main_firewall_healthy(){
+main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
     lan_net=$(get_lan_net)
@@ -296,35 +301,6 @@ restart_dnsmasq_and_wait(){
 # Resolve configured domains after Apply without blocking the web request.
 # dnsmasq adds the resulting addresses to awg_dst. Only one prefill job is
 # allowed at a time; /tmp is cleared on reboot if a job is interrupted.
-pre_resolve_domains_async(){
-    [ -s "$DNSMASQ_AWG_CONF" ] || return 0
-
-    (
-        if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
-            log_msg "Domain pre-resolution already running"
-            exit 0
-        fi
-        trap 'rm -rf "$DNS_PREFILL_LOCK"' 0 1 2 15
-
-        local total bg_count domain_file
-        domain_file="$DNS_PREFILL_LOCK/domains"
-        awk -F/ '/^ipset=/{for(i=2;i<NF;i++) if($i!="") print $i}' \
-            "$DNSMASQ_AWG_CONF" > "$domain_file"
-        total=$(wc -l < "$domain_file" | tr -d ' ')
-        log_msg "Domain pre-resolution started: $total domains"
-
-        bg_count=0
-        while read -r domain; do
-            [ -z "$domain" ] && continue
-            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
-            bg_count=$((bg_count + 1))
-            [ "$bg_count" -ge 10 ] && { wait; bg_count=0; }
-        done < "$domain_file"
-        wait
-
-        log_msg "Domain pre-resolution finished: $total domains"
-    ) </dev/null >/dev/null 2>&1 &
-}
 
 # Wait for network interface IP. Usage: wait_for_iface_ip <iface> <timeout>
 wait_for_iface_ip(){
@@ -446,10 +422,12 @@ download_geoip_service(){
     valid_geo_service_name "$svc" || return 1
     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-        grep -v ":" "$tmp" > "$GEO_DIR/geoip/v2fly_${svc}.cidr"
-        rm -f "$tmp"
-        [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] || { rm -f "$GEO_DIR/geoip/v2fly_${svc}.cidr"; return 1; }
-        return 0
+        if normalize_cidrs "$tmp" "$tmp.valid" 1; then
+            mv "$tmp.valid" "$GEO_DIR/geoip/v2fly_${svc}.cidr" || return 1
+            rm -f "$tmp"
+            return 0
+        fi
+        log_msg "ERROR: Invalid GeoIP response for $svc; cached list retained"
     fi
     rm -f "$tmp"
     return 1
@@ -490,7 +468,7 @@ download_all_geo(){
     local tmp_yml="$GEO_DIR/v2fly_all.yml.tmp"
     if curl -sfL --connect-timeout 10 --max-time 120 "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat_plain.yml" \
         -o "$tmp_yml" 2>/dev/null; then
-        if [ -s "$tmp_yml" ]; then
+        if [ -s "$tmp_yml" ] && awk '/^[[:space:]]*- name:/{names++} /"(domain|full):/{rules++} END{exit !(names>0 && rules>0)}' "$tmp_yml"; then
             mv "$tmp_yml" "$GEO_DIR/v2fly_all.yml"
             grep -E '^[[:space:]]*- name:' "$GEO_DIR/v2fly_all.yml" | \
                 sed 's/.*- name:[[:space:]]*//;s/^"//;s/"$//' | \
@@ -614,13 +592,13 @@ cleanup_firewall(){
     rm -f "$DNSMASQ_AWG_CONF"
     [ -f "$DNSMASQ_INCLUDE" ] && sed -i "\|${DNSMASQ_AWG_CONF}|d" "$DNSMASQ_INCLUDE"
 
-    cleanup_ipv6_block
-
     log_msg "Firewall rules cleaned"
 }
 
-setup_firewall(){
+setup_firewall_body(){
     cleanup_firewall
+    ensure_main_routes || return 1
+    ensure_base_firewall || return 1
 
     local default_policy=$(get_setting awg_default_policy)
     [ -z "$default_policy" ] && default_policy="direct"
@@ -630,7 +608,7 @@ setup_firewall(){
     ipset create "$IPSET_NAME" hash:net family inet hashsize 4096 maxelem 131072 timeout 86400 2>/dev/null
     if ! ipset list "$IPSET_NAME" >/dev/null 2>&1; then
         log_msg "ERROR: ipset $IPSET_NAME creation failed, geo routing disabled"
-        has_geo=false
+        return 1
     fi
 
     # --- Load selected GeoIP subnets into ipset (bulk) ---
@@ -641,7 +619,7 @@ setup_firewall(){
     for svc in $selected_services; do
         f="$GEO_DIR/geoip/v2fly_${svc}.cidr"
         [ ! -f "$f" ] && continue
-        ipset_load_file "$f" "$IPSET_NAME"
+        ipset_load_file "$f" "$IPSET_NAME" || return 1
         ip_count=$((ip_count + $(wc -l < "$f")))
     done
 
@@ -649,7 +627,7 @@ setup_firewall(){
     for f in "$GEO_DIR"/geoip/*.cidr; do
         [ ! -f "$f" ] && continue
         case "${f##*/}" in v2fly_*.cidr) continue ;; esac
-        ipset_load_file "$f" "$IPSET_NAME"
+        ipset_load_file "$f" "$IPSET_NAME" || return 1
         ip_count=$((ip_count + $(wc -l < "$f")))
     done
 
@@ -661,15 +639,17 @@ setup_firewall(){
 
     # --- Extract v2fly domains from downloaded database ---
     local geo_v2fly=$(get_setting awg_geo_v2fly)
+    : > "$GEO_DIR/domains/warnings.txt"
     rm -f "$GEO_DIR/domains/v2fly_"*.txt
     if [ -n "$geo_v2fly" ] && [ -f "$GEO_DIR/v2fly_all.yml" ]; then
         for svc in $(echo "$geo_v2fly" | tr ',' ' '); do
             svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
-            valid_geo_service_name "$svc" || {
+            valid_geosite_name "$svc" || {
                 log_msg "WARNING: Invalid GeoSite category: $svc"
                 continue
             }
-            awk -v cat="$svc" '
+            awk -v cat="$svc" -v warnings="$GEO_DIR/domains/warnings.txt" '
+                BEGIN{split(cat,sel,"@");cat=sel[1];attr=sel[2]}
                 /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
                     name=$0
                     sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name)
@@ -681,9 +661,12 @@ setup_firewall(){
                     rule=$0
                     sub(/^[[:space:]]*-[[:space:]]*/, "", rule)
                     sub(/^"/, "", rule); sub(/"[[:space:]]*$/, "", rule)
+                    if (attr!="" && index(rule, ":@" attr)==0)next
+                    if (rule ~ /^(keyword|regexp):/) {print cat ": unsupported " rule >> warnings; next}
+                    if (rule ~ /^full:/) {print cat ": full domain includes subdomains in dnsmasq: " rule >> warnings}
                     if (rule ~ /^(domain|full):/) {
                         sub(/^[^:]*:/, "", rule)
-                        sub(/:@[^:]*$/, "", rule)
+                        sub(/:@.*/, "", rule)
                         if (rule != "") print rule
                     }
                 }
@@ -693,6 +676,10 @@ setup_firewall(){
                 log_msg "WARNING: GeoSite category empty or not found: $svc"
             fi
         done
+    fi
+
+    if [ -s "$GEO_DIR/domains/warnings.txt" ]; then
+        log_msg "WARNING: GeoSite conversion limitations: $(wc -l < "$GEO_DIR/domains/warnings.txt") rules; see status"
     fi
 
     # --- Save custom domains/IPs ---
@@ -708,8 +695,8 @@ setup_firewall(){
         mkdir -p "$GEO_DIR/geoip"
         echo "$custom_ips" | tr ',' '\n' | while read -r cidr; do
             cidr=$(echo "$cidr" | tr -d ' \r')
-            [ -n "$cidr" ] && ipset add "$IPSET_NAME" "$cidr" timeout 0 2>/dev/null
-        done
+            [ -n "$cidr" ] && ipset add "$IPSET_NAME" "$cidr" timeout 0 -exist 2>/dev/null || exit 1
+        done || return 1
     fi
 
     # Save a conservative floor for static GeoIP/Custom IP entries. Dynamic
@@ -750,6 +737,20 @@ setup_firewall(){
         done < "$f"
         [ $chunk_count -gt 0 ] && echo "${chunk_line}${IPSET_NAME}" >> "$DNSMASQ_AWG_CONF"
     done
+
+    local selected_dns
+    selected_dns=$(get_setting awg_dns)
+    if [ -n "$selected_dns" ]; then
+        awk -F/ '/^ipset=/{for(i=2;i<NF;i++)if($i!="")print $i}' "$DNSMASQ_AWG_CONF" | sort -u |
+        while IFS= read -r domain; do
+            for server_ip in $(printf '%s' "$selected_dns" | tr ',' ' '); do
+                printf 'server=/%s/%s\n' "$domain" "$server_ip"
+            done
+        done > "$DNSMASQ_AWG_CONF.servers"
+        cat "$DNSMASQ_AWG_CONF.servers" >> "$DNSMASQ_AWG_CONF"
+        rm -f "$DNSMASQ_AWG_CONF.servers"
+    fi
+    dnsmasq --test --conf-file="$DNSMASQ_AWG_CONF" >/dev/null 2>&1 || { log_msg "ERROR: generated DNS config rejected"; return 1; }
 
     # Add conf-file include to dnsmasq (idempotent)
     if [ $domain_count -gt 0 ]; then
@@ -875,28 +876,29 @@ setup_firewall(){
     fi
 
     # --- Restart dnsmasq if geo active ---
-    if [ $domain_count -gt 0 ] || [ "$has_geo" = true ]; then
-        restart_dnsmasq_and_wait 15
+    if true; then
+        restart_dnsmasq_and_wait 15 || return 1
     fi
 
-    # --- Always flush conntrack so devices reconnect through VPN ---
+    # Existing unrelated sessions are retained. Selective invalidation only.
     flush_conntrack
 
     # Keep both independent routing systems healthy after every firewall rebuild.
     save_and_set_rp_filter
-    ensure_ui_mark_nat
+    ensure_ui_mark_nat || return 1
     local source_addr
     source_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
     [ -n "$source_addr" ] && ip rule add from "$source_addr" lookup $RT_TABLE prio 100
-    repair_aux_routing
     register_managed_cron
 
     managed_firewall_rules > "$FIREWALL_EXPECTED"
+    ip_count=$(ipset list "$IPSET_NAME" -t | awk '/Number of entries/{print $NF}')
+    domain_count=$(awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i}' "$DNSMASQ_AWG_CONF" | sort -u | wc -l)
     log_msg "Firewall configured: $ip_count IPs, $domain_count domains"
 
     # Populate dynamic domain addresses after the rules are active. Do not
     # make Apply wait for hundreds of DNS queries or their timeouts.
-    [ "$domain_count" -gt 0 ] && pre_resolve_domains_async
+    return 0
 }
 
 save_clients(){
@@ -925,15 +927,15 @@ update_geo_if_needed(){
 
     # Apply must be sufficient when a category is deselected.  Prune before
     # downloading missing selections and before setup_firewall runs.
-    prune_unselected_geoip_lists "$selected_services"
+    # Prune only during validated Apply.
 
     for svc in $selected_services; do
         [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] && continue
         log_msg "GeoIP: downloading newly selected $svc..."
-        download_geoip_service "$svc" || log_msg "WARNING: GeoIP $svc download failed"
+        download_geoip_service "$svc" || { log_msg "ERROR: GeoIP $svc download failed"; return 1; }
     done
     if [ -n "$(get_setting awg_geo_v2fly)" ] && [ ! -s "$GEO_DIR/v2fly_all.yml" ]; then
-        log_msg "WARNING: GeoSite database not downloaded. Use Update Now in web UI."
+        download_all_geo || return 1
     fi
 }
 
@@ -957,6 +959,8 @@ validate_endpoint(){
     echo "$port" | grep -qE '^[0-9]+$' || { log_msg "ERROR: Invalid endpoint port: $1"; return 1; }
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null || { log_msg "ERROR: Endpoint port out of range: $port"; return 1; }
     [ -n "$host" ] || { log_msg "ERROR: Empty endpoint host"; return 1; }
+    case "$host" in *:*|*\[*|*\]*) log_msg "ERROR: IPv6 endpoint unsupported; use IPv4 or a hostname"; return 1;; esac
+    valid_domain "$host" || return 1
     return 0
 }
 
@@ -986,8 +990,7 @@ validate_uint_or_range() {
 }
 
 validate_ip(){
-    echo "$1" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || return 1
-    return 0
+    valid_ipv4 "$1"
 }
 
 # --- Generate awg0.conf ---
@@ -1110,9 +1113,9 @@ generate_config(){
     chmod 600 "$CONF"
 
     local address=$(get_setting awg_address)
-    [ -n "$address" ] && echo "$address" > "$AWG_DIR/awg0.addr"
+    if [ -n "$address" ]; then printf '%s\n' "$address" > "$AWG_DIR/awg0.addr"; else rm -f "$AWG_DIR/awg0.addr"; fi
     local dns=$(get_setting awg_dns)
-    [ -n "$dns" ] && echo "$dns" > "$AWG_DIR/awg0.dns"
+    rm -f "$AWG_DIR/awg0.dns" # DNS is generated in dnsmasq_awg.conf.
 
     log_msg "Config saved"
     return 0
@@ -1126,8 +1129,8 @@ do_start(){
 
     if is_running; then
         log_msg "Already running"
-        ensure_ui_mark_nat
-        repair_aux_routing
+        ensure_ui_mark_nat || return 1
+        repair_aux_routing || return 1
         register_managed_cron
         update_status
         return 0
@@ -1145,6 +1148,8 @@ do_start(){
 
     acquire_lock || { log_msg "Cannot acquire lock, aborting start"; update_status; return 1; }
 
+    validate_runtime_settings || return 1
+    update_geo_if_needed || return 1
     generate_config || { update_status; release_lock; return 1; }
     [ ! -f "$CONF" ] && { log_msg "ERROR: No config"; update_status; release_lock; return 1; }
     [ ! -f "$AWG_GO" ] && { log_msg "ERROR: amneziawg-go not found"; update_status; release_lock; return 1; }
@@ -1178,7 +1183,7 @@ do_start(){
     gw=$(ip route | awk '/^default/{print $3; exit}')
     endpoint=$(get_endpoint)
     [ -n "$endpoint" ] && [ -n "$gw" ] && ip route add "$endpoint" via "$gw" 2>/dev/null
-    ensure_main_routes
+    ensure_main_routes || return 1
 
     save_and_set_rp_filter
 
@@ -1195,7 +1200,7 @@ do_start(){
         iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE
     fi
 
-    setup_firewall
+    setup_firewall || { do_stop; return 1; }
 
     log_msg "Started, verifying tunnel connectivity..."
     update_status
@@ -1220,6 +1225,7 @@ do_start(){
         do_stop 2>/dev/null
         log_msg "VPN stopped automatically. Check server config and endpoint reachability."
         update_status
+        return 1
     fi
 }
 
@@ -1228,6 +1234,8 @@ do_start(){
 do_stop(){
     acquire_lock || { log_msg "Cannot acquire lock, aborting stop"; return 1; }
 
+    cancel_prefill || return 1
+    rm -f /tmp/.awg_static_members /tmp/.awg_dns_expected /tmp/.awg_dns_pending
     remove_managed_cron
     if [ "${WATCHDOG_RECOVERY:-0}" = "1" ]; then
         cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
@@ -1277,78 +1285,6 @@ do_stop(){
 
 # --- Status JSON for web UI ---
 
-update_status(){
-    local running=false
-    local pub_key=""
-    local listen_port=""
-    local iface_addr=""
-    local peers_json="[]"
-    local log_text=""
-
-    if is_running; then
-        running=true
-        iface_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
-        listen_port=$("$AWG_BIN" show "$IFACE" listen-port 2>/dev/null)
-        pub_key=$("$AWG_BIN" show "$IFACE" public-key 2>/dev/null)
-
-        local dump=$("$AWG_BIN" show "$IFACE" dump 2>/dev/null | tail -n +2)
-        if [ -n "$dump" ]; then
-            local p_items=""
-            while IFS='	' read -r pkey psk endpoint aips handshake rx tx keepalive; do
-                local hs_text="never"
-                if [ "$handshake" != "0" ] && [ -n "$handshake" ]; then
-                    local ago=$(( $(date +%s) - handshake ))
-                    if [ $ago -lt 60 ]; then hs_text="${ago}s ago"
-                    elif [ $ago -lt 3600 ]; then hs_text="$(( ago / 60 ))m ago"
-                    else hs_text="$(( ago / 3600 ))h ago"; fi
-                fi
-                local rx_h=$(human_size "${rx:-0}")
-                local tx_h=$(human_size "${tx:-0}")
-                local item="{\"endpoint\":\"${endpoint}\",\"allowed_ips\":\"${aips}\",\"transfer_rx\":\"${rx_h}\",\"transfer_tx\":\"${tx_h}\",\"latest_handshake\":\"${hs_text}\"}"
-                [ -n "$p_items" ] && p_items="${p_items},${item}" || p_items="$item"
-            done <<EOF
-$dump
-EOF
-            peers_json="[${p_items}]"
-        fi
-    fi
-
-    log_text=$(grep "amneziawg" /tmp/syslog.log 2>/dev/null | tail -20 | sed 's/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')
-
-    local default_policy=$(get_setting awg_default_policy)
-    [ -z "$default_policy" ] && default_policy="direct"
-    local clients_data=$(get_setting awg_clients | sed 's/"/\\"/g')
-    local active_rules=$(ip rule show 2>/dev/null | grep -c "lookup $RT_TABLE\|fwmark $FWMARK")
-
-    local ipset_count=0
-    ipset list "$IPSET_NAME" -t 2>/dev/null | grep -q "Number of entries" && \
-        ipset_count=$(ipset list "$IPSET_NAME" -t 2>/dev/null | awk '/Number of entries/{print $NF}')
-
-    local antifilter_active=false
-    local antifilter_count=0
-    antifilter_enabled && antifilter_active=true
-    ipset list MYAWG -t 2>/dev/null | grep -q "Number of entries" && \
-        antifilter_count=$(ipset list MYAWG -t 2>/dev/null | awk '/Number of entries/{print $NF}')
-
-    local geo_domains=0
-    [ -f "$DNSMASQ_AWG_CONF" ] && geo_domains=$(grep -c "^ipset=" "$DNSMASQ_AWG_CONF" 2>/dev/null)
-    [ -z "$geo_domains" ] && geo_domains=0
-
-    local geo_downloaded=false
-    geo_available && geo_downloaded=true
-
-    local package_version go_version tools_version
-    package_version=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2; exit}')
-    [ -z "$package_version" ] && package_version="$AWG_VERSION"
-    go_version=$(cat /opt/amneziawg/amneziawg-go.version 2>/dev/null)
-    tools_version=$(cat /opt/amneziawg/amneziawg-tools.version 2>/dev/null)
-    [ -n "$go_version" ] || go_version=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $2}')
-    [ -n "$tools_version" ] || tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $2}')
-
-    cat > "$STATUS_FILE" << STATUSEOF
-{"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"antifilter_enabled":${antifilter_active},"antifilter_count":${antifilter_count},"log":"${log_text}"}
-STATUSEOF
-}
 
 # --- Install/Mount/Uninstall ---
 
@@ -1401,10 +1337,12 @@ do_install_page(){
     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
 
     if is_running; then
-        repair_aux_routing
+        repair_aux_routing || return 1
         register_managed_cron
     fi
 
+    ensure_status_loop
+    update_status
     log_msg "Page installed: $am_webui_page"
     echo "Installed. Access: VPN > AmneziaWG"
 }
@@ -1422,9 +1360,10 @@ do_mount_ui(){
     fi
 
     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
+    ensure_status_loop
     update_status
 
-    if [ "$(get_setting awg_autostart)" = "1" ]; then
+    if autostart_enabled; then
         sleep 10
         do_start
     fi
@@ -1480,6 +1419,7 @@ do_watchdog(){
         # Even an early startup failure must leave another recovery attempt.
         cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
         WATCHDOG_RECOVERY=0
+        update_status
         return "$restart_result"
     fi
 
@@ -1493,9 +1433,10 @@ do_watchdog(){
         fi
     fi
 
+    ensure_status_loop
     # Firmware can reset rp_filter and awg0 recreation removes table 400.
     save_and_set_rp_filter
-    ensure_ui_mark_nat
+    ensure_ui_mark_nat || return 1
     repair_aux_routing
 }
 
@@ -1529,85 +1470,6 @@ check_update(){
     echo "{\"current\":\"$current\",\"latest\":\"$latest\",\"update\":$update,\"installed_go\":\"$installed_go\",\"latest_go\":\"$latest_go\",\"installed_tools\":\"$installed_tools\",\"latest_tools\":\"$latest_tools\",\"error\":\"$error\"}"
 }
 
-do_update(){
-    log_msg "Updating AmneziaWG..."
-    local pkg_arch
-    pkg_arch=$(opkg print-architecture 2>/dev/null | awk '$1=="arch" && $2!="all" {print $2}' | head -1)
-    if [ -z "$pkg_arch" ]; then
-        local arch=$(uname -m)
-        case "$arch" in
-            aarch64) pkg_arch="aarch64-3.10" ;;
-            armv7l)  pkg_arch="armv7-2.6" ;;
-            *) log_msg "ERROR: Unsupported arch: $arch"; return 1 ;;
-        esac
-    fi
-
-    local release_json
-    release_json=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" 2>/dev/null)
-    local ipk_url sums_url latest
-    latest=$(echo "$release_json" | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
-    ipk_url=$(echo "$release_json" | grep '"browser_download_url"' | grep "$pkg_arch" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
-    if [ -z "$ipk_url" ]; then
-        local base_arch=$(echo "$pkg_arch" | sed 's/-.*//')
-        ipk_url=$(echo "$release_json" | grep '"browser_download_url"' | grep "${base_arch}" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
-    fi
-    if [ -z "$ipk_url" ]; then
-        log_msg "ERROR: No package found for $pkg_arch"
-        return 1
-    fi
-    sums_url=$(echo "$release_json" | grep '"browser_download_url"' | grep '/SHA256SUMS"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
-    if [ -z "$sums_url" ]; then
-        log_msg "ERROR: SHA256SUMS not found in release"
-        return 1
-    fi
-
-    local tmp="/tmp/amneziawg_update.ipk"
-    local sums="/tmp/amneziawg_SHA256SUMS"
-    if ! curl -sfL --connect-timeout 10 --max-time 120 "$ipk_url" -o "$tmp"; then
-        log_msg "ERROR: Download failed"
-        return 1
-    fi
-    if ! curl -sfL --connect-timeout 10 --max-time 30 "$sums_url" -o "$sums"; then
-        rm -f "$tmp"
-        log_msg "ERROR: SHA256SUMS download failed"
-        return 1
-    fi
-    local expected actual package_name
-    package_name=$(basename "$ipk_url")
-    expected=$(awk -v f="$package_name" '$2==f || $2=="*"f {print $1; exit}' "$sums")
-    actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
-    rm -f "$sums"
-    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
-        rm -f "$tmp"
-        log_msg "ERROR: Package SHA256 mismatch"
-        return 1
-    fi
-
-    local backup_dir="/opt/backup-amneziawg-before-${latest:-update}-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup_dir"
-    cp -a "$SETTINGS" "$backup_dir/" 2>/dev/null || true
-    cp -a "$CONF" "$AWG_DIR/awg0.addr" "$CLIENTS_FILE" "$backup_dir/" 2>/dev/null || true
-    log_msg "Backup saved: $backup_dir"
-
-    do_stop 2>/dev/null
-    wait_for_pid_exit amneziawg-go 10
-    # Block auto-start during opkg install (S99amneziawg is triggered by opkg)
-    touch /tmp/.awg_no_autostart
-    if ! /opt/bin/opkg install "$tmp" && ! /opt/bin/opkg install --force-architecture "$tmp"; then
-        rm -f "$tmp" /tmp/.awg_no_autostart
-        log_msg "ERROR: Package installation failed"
-        return 1
-    fi
-    rm -f "$tmp"
-    # Stop VPN if opkg's init script started it
-    do_stop 2>/dev/null
-    wait_for_pid_exit amneziawg-go 10
-    rm -f /tmp/.awg_no_autostart
-    # Install page from new version
-    /jffs/addons/amneziawg/amneziawg.sh install_page
-    log_msg "Update complete. Start VPN from UI."
-    update_status
-}
 
 do_wan_event(){
     local wan_if="$1" wan_state="$2"
@@ -1628,32 +1490,7 @@ do_wan_event(){
 do_firewall_restart(){
     if is_running; then
         log_msg "Firewall restart detected, re-applying rules"
-        # Clean base rules first to prevent duplicates
-        iptables -D INPUT -i "$IFACE" -j ACCEPT 2>/dev/null
-        iptables -D FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null
-        iptables -D FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null
-        iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-        iptables -t mangle -D FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-        local lan_net_old
-        lan_net_old=$(get_lan_net)
-        [ -n "$lan_net_old" ] && iptables -t nat -D POSTROUTING -s "$lan_net_old" -o "$IFACE" -j MASQUERADE 2>/dev/null
-        iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null
-        cleanup_ipv6_block
-        iptables -I INPUT -i "$IFACE" -j ACCEPT
-        iptables -I FORWARD -i "$IFACE" -j ACCEPT
-        iptables -I FORWARD -o "$IFACE" -j ACCEPT
-        iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-        iptables -t mangle -A FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-        local lan_net
-        lan_net=$(get_lan_net)
-        if [ -n "$lan_net" ]; then
-            iptables -t nat -I POSTROUTING -s "$lan_net" -o "$IFACE" -j MASQUERADE
-        else
-            iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE
-        fi
-        setup_ipv6_block
-        setup_firewall
-        ensure_main_routes
+        setup_firewall || return 1
     fi
 }
 
@@ -1665,13 +1502,15 @@ do_service_event(){
         awgstart)       do_start ;;
         awgstop)        do_stop ;;
         awgrestart)     do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
-        awgsaveconf)
+        awgsaveconf|awgsaveupdategeo)
             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(get_setting awg_privatekey)" ]; do sleep 1; _wt=$((_wt+1)); done
             local old_config new_config
             old_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
+            validate_runtime_settings || return 1
             generate_config || return 1
             new_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
-            update_geo_if_needed
+            if [ "$event" = awgsaveupdategeo ]; then update_geo_lists || return 1;
+            else update_geo_if_needed || return 1; fi
             if is_running && [ "$old_config" != "$new_config" ]; then
                 log_msg "Tunnel settings changed; restarting"
                 do_stop
@@ -1679,26 +1518,26 @@ do_service_event(){
                 return $?
             fi
             if is_running; then
-                setup_firewall
+                setup_firewall || return 1
             elif ! antifilter_enabled; then
                 disable_aux_routing
             fi
             update_status
             ;;
         awgupdategeo)
-            update_geo_lists
-            is_running && setup_firewall
+            update_geo_lists || return 1
+            if is_running; then setup_firewall || return 1; fi
             update_status
             ;;
         awgupdateantifilter)
-            update_antifilter
+            update_antifilter || return 1
             update_status
             ;;
         awgcheckupdate)
             check_update > /www/user/awg_update.htm
             ;;
         awgdoupdate)
-            do_update
+            do_update || return 1
             update_status
             ;;
     esac
@@ -1715,16 +1554,33 @@ tunnel_healthy(){
     return 1
 }
 
+. "${AWG_RUNTIME_PATH:-$ADDON_DIR/awg-runtime.sh}" || exit 1
+
 # --- Main ---
 
 # Serialize runtime changes. Package upgrades manage stop/install separately
 # because opkg invokes this script again from its installation hooks.
 operation="$1"
-[ "$1" = "service_event" ] && operation="$3"
+if [ "$1" = "service_event" ]; then
+    operation=${3%%_*}
+    operation_id=${3#*_}
+    case "$operation_id" in ''|*[!0-9]*) operation_id=0;; esac
+    [ "$operation_id" = 0 ] || operation_write "$operation_id" running "$operation"
+fi
 case "$operation" in
-    status|check_update|awgcheckupdate|update|awgdoupdate) ;;
+    status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
     *)
-        acquire_lock || exit 1
+        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
+            log_msg 'ERROR: package update in progress'
+            [ -z "${operation_id:-}" ] || operation_write "$operation_id" failed 'Package update in progress'
+            exit 1
+        fi
+        acquire_lock || { [ -n "${operation_id:-}" ] && operation_write "$operation_id" failed "Busy; retry after the current operation"; exit 1; }
+        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
+            release_lock
+            [ -z "${operation_id:-}" ] || operation_write "$operation_id" failed 'Package update in progress'
+            exit 1
+        fi
         DISPATCH_LOCK=1
         trap 'rm -rf "$LOCKDIR"' 0
         trap 'exit 1' 1 2 15
@@ -1733,10 +1589,13 @@ esac
 
 case "$1" in
     start)          do_start ;;
+    boot_start)     if autostart_enabled; then do_start; fi ;;
+    status_loop)    status_loop ;;
+    prefill_worker) prefill_worker ;;
     stop)           do_stop ;;
     restart)        do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
     status)         update_status ;;
-    update_geo)     update_geo_lists; is_running && setup_firewall; update_status ;;
+    update_geo)     update_geo_lists && { if is_running; then setup_firewall; fi; } && update_status ;;
     update_ipset)   update_antifilter ;;
     check_update)   check_update ;;
     update)         do_update ;;
@@ -1744,9 +1603,16 @@ case "$1" in
     install_page)   do_install_page ;;
     mount_ui)       do_mount_ui ;;
     uninstall)      do_uninstall ;;
-    service_event)  do_service_event "$2" "$3" ;;
+    service_event)  do_service_event "$2" "$operation" ;;
     wan_event)      do_wan_event "$2" "$3" ;;
     firewall_restart) do_firewall_restart ;;
     download_geo)   download_all_geo ;;
     *)              echo "Usage: $0 {start|stop|restart|status|update_geo|update_ipset|download_geo|install_page|uninstall}" ;;
 esac
+
+operation_result=$?
+if [ -n "${operation_id:-}" ] && [ "$operation_id" != 0 ]; then
+    if [ "$operation_result" = 0 ]; then operation_write "$operation_id" succeeded "$operation";
+    else operation_write "$operation_id" failed "Operation failed; see log"; fi
+fi
+exit "$operation_result"

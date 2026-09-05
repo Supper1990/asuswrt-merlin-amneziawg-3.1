@@ -3,6 +3,8 @@
 # Keeps MYAWG/mark 0x66/table 400 separate from the web UI's
 # awg_dst/mark 0x100/table 300.
 
+. "${AWG_COMMON_PATH:-/jffs/addons/amneziawg/awg-common.sh}" || exit 1
+
 URL="https://antifilter.download/list/allyouneed.lst"
 
 SET="MYAWG"
@@ -15,7 +17,8 @@ MARK="0x66"
 PRIO="10"
 
 # Incoming VPN clients that may override an existing firmware/service mark.
-VPN_SRC_NETS="10.8.0.0/24 10.10.10.0/24"
+VPN_SRC_NETS=$(awk '$1=="awg_vpn_source_nets" {sub(/^[^ ]+ /,"");gsub(/,/," ");print;exit}' /jffs/addons/custom_settings.txt 2>/dev/null)
+[ -n "$VPN_SRC_NETS" ] || VPN_SRC_NETS="10.8.0.0/24 10.10.10.0/24"
 
 BASE="/jffs/addons/awg-ipset"
 TMP="/tmp/allyouneed.lst"
@@ -54,7 +57,7 @@ add_rule_once(){
     chain="$2"
     shift 2
     iptables -t "$table" -C "$chain" "$@" 2>/dev/null || \
-        iptables -t "$table" -A "$chain" "$@"
+        iptables -t "$table" -A "$chain" "$@" || { ROUTING_FAILED=1; return 1; }
 }
 
 delete_rule_all(){
@@ -93,9 +96,9 @@ routing_is_active(){
 attach_chain_after_awg(){
     base_chain="$1"
 
-    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers 2>/dev/null | \
+    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | \
         awk '$2=="AWG" {n=$1} END {print n}')
-    myawg_line=$(iptables -t mangle -L "$base_chain" --line-numbers 2>/dev/null | \
+    myawg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | \
         awk -v chain="$CHAIN" '$2==chain {n=$1} END {print n}')
 
     if [ -n "$awg_line" ] && [ "$myawg_line" = "$((awg_line + 1))" ]; then
@@ -108,6 +111,7 @@ attach_chain_after_awg(){
     # Firmware/addon firewall rebuilds can change ordering, so reposition only
     # when needed. The UI-managed AWG chain must remain immediately before us.
     delete_rule_all mangle "$base_chain" -j "$CHAIN"
+    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | awk '$2=="AWG" {n=$1} END {print n}')
     if [ -n "$awg_line" ]; then
         iptables -t mangle -I "$base_chain" $((awg_line + 1)) -j "$CHAIN"
     else
@@ -116,51 +120,62 @@ attach_chain_after_awg(){
 }
 
 ensure_routing(){
+    ROUTING_FAILED=0
     antifilter_allowed || { disable_routing; return 1; }
     ip link show "$IFACE" >/dev/null 2>&1 || {
         log "ERROR: interface $IFACE not found"
         return 1
     }
 
-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
+    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
 
     if ! ip rule show 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE"; then
-        ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO"
+        ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" || return 1
     fi
-    ip route replace default dev "$IFACE" table "$TABLE"
+    ip route replace default dev "$IFACE" table "$TABLE" || return 1
     ip route flush cache 2>/dev/null
 
-    iptables -t mangle -N "$CHAIN" 2>/dev/null
-    # Explicit Direct devices must bypass AntiFilter, including VPN clients.
-    if ! iptables -t mangle -C "$CHAIN" -m mark --mark 0x101/0xffffffff -j RETURN 2>/dev/null; then
-        iptables -t mangle -I "$CHAIN" 1 -m mark --mark 0x101/0xffffffff -j RETURN
-    fi
-
+    # Replace the complete chain in one mangle-table commit. An invalid rule
+    # cannot leave half a chain active. Equal contents do not reset counters.
     lan_net=$(get_lan_net)
     endpoint_ip=$(get_endpoint_ip 2>/dev/null)
+    desired_file="$RESTORE.chain"
+    {
+        echo "-A $CHAIN -m mark --mark 0x101/0xffffffff -j RETURN"
+        echo "-A $CHAIN -m addrtype --dst-type LOCAL -j RETURN"
+        [ -z "$lan_net" ] || echo "-A $CHAIN -d $lan_net -j RETURN"
+        echo "-A $CHAIN -p udp -m multiport --dports 67,68,123 -j RETURN"
+        echo "-A $CHAIN -d 224.0.0.0/4 -j RETURN"
+        [ -z "$endpoint_ip" ] || echo "-A $CHAIN -d $endpoint_ip/32 -j RETURN"
+        for vpn_net in $VPN_SRC_NETS; do
+            # Do not allow setting contents to become iptables-restore syntax.
+            case "$vpn_net" in *[!0-9./]*|'') log 'ERROR: invalid VPN source network'; return 1;; esac
+            echo "-A $CHAIN -s $vpn_net -m set --match-set $SET dst -j MARK --set-mark $MARK"
+        done
+        echo "-A $CHAIN -m mark --mark 0x100/0xffffffff -j RETURN"
+        echo "-A $CHAIN -m mark ! --mark 0x0/0xffffffff -j RETURN"
+        echo "-A $CHAIN -m set --match-set $SET dst -j MARK --set-mark $MARK"
+    } > "$desired_file" || return 1
+    actual=$(iptables -t mangle -S "$CHAIN" 2>/dev/null)
+    if ! cmp -s "$desired_file" /tmp/.myawg_chain_desired || [ "$actual" != "$(cat /tmp/.myawg_chain_rules 2>/dev/null)" ]; then
+        {
+            echo '*mangle'
+            echo ":$CHAIN - [0:0]"
+            echo "-F $CHAIN"
+            cat "$desired_file"
+            echo COMMIT
+        } > "$RESTORE.chain-restore"
+        iptables-restore --noflush < "$RESTORE.chain-restore" || return 1
+    fi
 
-    add_rule_once mangle "$CHAIN" -m addrtype --dst-type LOCAL -j RETURN
-    [ -n "$lan_net" ] && add_rule_once mangle "$CHAIN" -d "$lan_net" -j RETURN
-    add_rule_once mangle "$CHAIN" -p udp -m multiport --dports 67,68,123 -j RETURN
-    add_rule_once mangle "$CHAIN" -d 224.0.0.0/4 -j RETURN
-    [ -n "$endpoint_ip" ] && add_rule_once mangle "$CHAIN" -d "$endpoint_ip"/32 -j RETURN
-
-    # These source-specific rules intentionally precede the mark guards.
-    for vpn_net in $VPN_SRC_NETS; do
-        add_rule_once mangle "$CHAIN" -s "$vpn_net" \
-            -m set --match-set "$SET" dst -j MARK --set-mark "$MARK"
-    done
-
-    # Preserve the UI-managed mark and all other non-zero service marks.
-    add_rule_once mangle "$CHAIN" -m mark --mark 0x100/0xffffffff -j RETURN
-    add_rule_once mangle "$CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN
-    add_rule_once mangle "$CHAIN" -m set --match-set "$SET" dst -j MARK --set-mark "$MARK"
-
-    attach_chain_after_awg PREROUTING
-    attach_chain_after_awg OUTPUT
+    attach_chain_after_awg PREROUTING || return 1
+    attach_chain_after_awg OUTPUT || return 1
 
     add_rule_once nat POSTROUTING \
         -m mark --mark "$MARK"/0xffffffff -o "$IFACE" -j MASQUERADE
+    [ "$ROUTING_FAILED" = 0 ] && routing_is_active || return 1
+    iptables -t mangle -S "$CHAIN" > /tmp/.myawg_chain_rules || return 1
+    cp "$desired_file" /tmp/.myawg_chain_desired
 }
 
 disable_routing(){
@@ -184,7 +199,9 @@ disable_routing(){
     ip route flush cache 2>/dev/null
     ipset destroy "$TMP_SET" 2>/dev/null
     ipset destroy "$SET" 2>/dev/null
-    [ "$was_active" = true ] && log "AntiFilter disabled"
+    rm -f /tmp/.myawg_chain_rules /tmp/.myawg_chain_desired
+    [ "$was_active" != true ] || log "AntiFilter disabled"
+    return 0
 }
 
 full_rebuild_from_new_list(){
@@ -203,32 +220,41 @@ full_rebuild_from_new_list(){
         ipset destroy "$TMP_SET" 2>/dev/null
         return 1
     fi
+    # Prepare durable cache before touching the live set. Keep the old cache
+    # until swap is known to have succeeded; every next update reconciles members.
+    cp "$NEW_LIST" "$OLD_LIST.tmp" || return 1
     if ! ipset swap "$TMP_SET" "$SET"; then
+        rm -f "$OLD_LIST.tmp"
         log "ERROR: ipset swap failed; cache unchanged"
         return 1
     fi
-    ipset destroy "$TMP_SET" 2>/dev/null
-    if ! cp "$NEW_LIST" "$OLD_LIST.tmp" || ! mv "$OLD_LIST.tmp" "$OLD_LIST"; then
-        log "ERROR: cannot commit AntiFilter cache"
+    if ! mv "$OLD_LIST.tmp" "$OLD_LIST"; then
+        ipset swap "$TMP_SET" "$SET" || log "ERROR: rollback swap failed"
+        log "ERROR: cannot commit cache; rolled back live set"
         return 1
     fi
+    ipset destroy "$TMP_SET" 2>/dev/null
     log "Full rebuild done"
 }
 
 restore_from_cache_if_needed(){
-    count=$(ipset_count)
-    [ -n "$count" ] || count=0
-    [ "$count" -ge "$MIN_NETS" ] 2>/dev/null && return 0
-    [ -s "$OLD_LIST" ] || { log "ipset empty and no cached list"; return 1; }
-    log "Restoring depleted ipset from cache (entries: $count)"
-    cp "$OLD_LIST" "$NEW_LIST"
+    [ -s "$OLD_LIST" ] || { log "No cached list"; return 1; }
+    normalize_cidrs "$OLD_LIST" "$RESTORE.checked" || { log "ERROR: invalid cached list"; return 1; }
+    set_members "$SET" > "$RESTORE.runtime" || return 1
+    if cmp -s "$RESTORE.checked" "$RESTORE.runtime"; then
+        rm -f "$RESTORE.runtime" "$RESTORE.checked"
+        return 0
+    fi
+    log "Restoring ipset: cached and active members differ"
+    mv "$RESTORE.checked" "$NEW_LIST" || return 1
+    rm -f "$RESTORE.runtime"
     full_rebuild_from_new_list
 }
 
 repair_runtime(){
     was_active=false
     routing_is_active && was_active=true
-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
+    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
     if ! restore_from_cache_if_needed; then
         log "No usable cached list; downloading AntiFilter"
         update_list
@@ -246,10 +272,13 @@ update_list(){
         log "ERROR: interface $IFACE not found"
         return 1
     }
-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
+    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
     # A reboot recreates an empty ipset. Populate it before applying a small
     # incremental diff, otherwise unchanged cached entries would be missing.
-    restore_from_cache_if_needed || true
+    if ! restore_from_cache_if_needed; then
+        # No usable cache: conditional HTTP responses cannot repair it.
+        rm -f "$ETAG_FILE" "$LM_FILE" "$HASH_FILE"
+    fi
     rm -f "$TMP" "$HDR" "$CURL_CONF"
 
     {
@@ -263,17 +292,12 @@ update_list(){
         echo "retry = 3"
         echo "dump-header = \"$HDR\""
         echo "output = \"$TMP\""
-        if [ -s "$ETAG_FILE" ]; then
-            etag=$(head -n 1 "$ETAG_FILE" | tr -d '\r')
-            [ -n "$etag" ] && echo "header = \"If-None-Match: $etag\""
-        fi
-        if [ -s "$LM_FILE" ]; then
-            modified=$(head -n 1 "$LM_FILE" | tr -d '\r')
-            [ -n "$modified" ] && echo "header = \"If-Modified-Since: $modified\""
-        fi
     } > "$CURL_CONF"
 
-    http_code=$(curl -K "$CURL_CONF" -w "%{http_code}" "$URL" 2>>"$LOG")
+    set --
+    if [ -s "$ETAG_FILE" ]; then set -- "$@" -H "If-None-Match: $(head -n 1 "$ETAG_FILE" | tr -d '\r')"; fi
+    if [ -s "$LM_FILE" ]; then set -- "$@" -H "If-Modified-Since: $(head -n 1 "$LM_FILE" | tr -d '\r')"; fi
+    http_code=$(curl -K "$CURL_CONF" "$@" -w "%{http_code}" "$URL" 2>>"$LOG")
     if [ "$http_code" = "304" ]; then
         log "AntiFilter list not modified"
         restore_from_cache_if_needed || return 1
@@ -288,7 +312,10 @@ update_list(){
         return 1
     fi
 
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$TMP" | sort -u > "$NEW_LIST"
+    if ! normalize_cidrs "$TMP" "$NEW_LIST"; then
+        log "ERROR: malformed AntiFilter response; old list retained"
+        return 1
+    fi
     new_count=$(wc -l < "$NEW_LIST" | tr -d ' ')
     log "Valid networks: $new_count"
     if [ "$new_count" -lt "$MIN_NETS" ]; then
@@ -300,7 +327,7 @@ update_list(){
 
     new_hash=$(md5sum "$NEW_LIST" | awk '{print $1}')
     old_hash=""
-    [ -s "$HASH_FILE" ] && old_hash=$(head -n 1 "$HASH_FILE" | tr -d '\r')
+    [ -s "$OLD_LIST" ] && old_hash=$(md5sum "$OLD_LIST" | awk '{print $1}')
     new_etag=$(grep -i '^ETag:' "$HDR" | tail -n 1 | sed 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//' | tr -d '\r')
     new_modified=$(grep -i '^Last-Modified:' "$HDR" | tail -n 1 | \
         sed 's/^[Ll][Aa][Ss][Tt]-[Mm][Oo][Dd][Ii][Ff][Ii][Ee][Dd]:[[:space:]]*//' | tr -d '\r')
@@ -319,6 +346,7 @@ update_list(){
         return 1
     fi
     echo "$new_hash" > "$HASH_FILE.tmp" && mv "$HASH_FILE.tmp" "$HASH_FILE" || return 1
+    rm -f "$ETAG_FILE" "$LM_FILE"
     [ -n "$new_etag" ] && printf '%s\n' "$new_etag" > "$ETAG_FILE"
     [ -n "$new_modified" ] && printf '%s\n' "$new_modified" > "$LM_FILE"
 
@@ -353,6 +381,10 @@ acquire_aux_lock(){
     echo $$ > "$LOCKDIR/pid"
 }
 
+if [ "${AWG_PACKAGE_CHILD:-0}" != 1 ] && [ -d /tmp/.awg_package_lock ]; then
+    package_owner=$(cat /tmp/.awg_package_lock/pid 2>/dev/null)
+    if [ -n "$package_owner" ] && kill -0 "$package_owner" 2>/dev/null; then log 'Package update in progress; retry later'; exit 1; fi
+fi
 acquire_aux_lock || exit 1
 trap 'rm -rf "$LOCKDIR"' 0
 trap 'exit 1' 1 2 15

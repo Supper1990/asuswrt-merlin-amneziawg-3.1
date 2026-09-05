@@ -16,7 +16,7 @@ FORCE=false
 exec 9>"/tmp/awg-merlin-builder.lock"
 flock -n 9 || { echo "Another AWG builder instance is running"; exit 0; }
 
-for cmd in docker git gh jq curl sha256sum file flock; do
+for cmd in docker git gh jq curl sha256sum file flock python3; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing command: $cmd"; exit 1; }
 done
 gh auth status >/dev/null 2>&1 || { echo "ERROR: run 'gh auth login' first"; exit 1; }
@@ -68,6 +68,7 @@ else
 fi
 
 rm -rf output
+bash tests/run.sh
 AWG_GO_TAG="$latest_go" AWG_TOOLS_TAG="$latest_tools" ./build.sh
 ./build-ipk.sh
 

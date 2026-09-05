@@ -6,3 +6,5 @@ kernel.config
 .DS_Store
 asuswrt-merlin-xrayui
 article_habr.md
+
+__pycache__/

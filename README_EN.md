@@ -277,3 +277,9 @@ MIT License
 Limitations: routing is IPv4-only; native IPv6 WAN traffic is not blocked. A warning replaces the misleading protection message. Rule-presence checks do not guarantee absence of conflicting third-party rules.
 
 Offline checks: `python3 tests/test_recovery.py` (mock system commands; router validation is still required).
+
+### Changes in 2.2.0-18
+
+List validation before application, rollback on detected runtime errors, complete AntiFilter membership checks, operation receipts in the UI, live status, MAC preservation, consistent autostart and package updates with a verified rollback package. The DNS field applies to selected domains. The global connection table is no longer flushed.
+
+See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitations and router acceptance checks. Packaging runs `bash tests/run.sh` (Python 3; the browser test also uses Node.js). Docker builds are not guaranteed to be byte-for-byte reproducible.

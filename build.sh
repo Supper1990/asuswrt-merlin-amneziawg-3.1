@@ -18,6 +18,13 @@ DOCKER_BUILDKIT=1 docker build \
 
 chmod 755 output/amneziawg-go output/awg
 
+{
+    printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
+    printf 'go_tag=%s\ntools_tag=%s\n' "$AWG_GO_TAG" "$AWG_TOOLS_TAG"
+    docker version --format '{{.Server.Version}}'
+    sha256sum Dockerfile output/amneziawg-go output/awg
+} > output/build-manifest.txt
+
 echo "Build complete:"
 ls -lh output/amneziawg-go output/awg
 sha256sum output/amneziawg-go output/awg

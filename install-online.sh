@@ -7,9 +7,10 @@ TMP_DIR=""
 
 cleanup(){
     [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
-    rm -f /tmp/.awg_no_autostart
+    if [ "${INSTALL_LOCKED:-0}" = 1 ]; then rm -f /tmp/.awg_no_autostart; rm -rf /tmp/.awg_package_lock; fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup 0
+trap 'exit 1' 1 2 15
 
 echo "============================================"
 echo "  AmneziaWG Installer"
@@ -37,6 +38,14 @@ if [ "$CPU_ARCH" != "aarch64" ] || [ "$PKG_ARCH" != "$SUPPORTED_ARCH" ]; then
     echo "ERROR: This release supports only ARM64/AArch64 with Entware $SUPPORTED_ARCH"
     exit 1
 fi
+
+if [ -f /jffs/addons/amneziawg/awg-runtime.sh ]; then
+    exec /jffs/addons/amneziawg/amneziawg.sh update
+fi
+mkdir /tmp/.awg_package_lock 2>/dev/null || { echo 'ERROR: another package installation is active'; exit 1; }
+INSTALL_LOCKED=1
+echo $$ > /tmp/.awg_package_lock/pid
+export AWG_PACKAGE_CHILD=1
 
 echo "Fetching latest release..."
 RELEASE_JSON=$(curl -sfL --connect-timeout 10 --max-time 30 \
@@ -90,8 +99,7 @@ echo "SHA256: OK"
 
 echo "Installing..."
 touch /tmp/.awg_no_autostart
-/opt/bin/opkg install "$TMP_DIR/$IPK_FILE" || \
-    /opt/bin/opkg install --force-architecture "$TMP_DIR/$IPK_FILE"
+/opt/bin/opkg install "$TMP_DIR/$IPK_FILE"
 RC=$?
 rm -f /tmp/.awg_no_autostart
 

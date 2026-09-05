@@ -102,6 +102,7 @@ var v2flyList = [];
 var v2flyIpList = ['telegram','google','facebook','twitter','netflix','cloudflare','fastly','cloudfront'];
 var antifilterRuntimeEnabled = true;
 var awgRuntimeRunning = false;
+var antifilterRuntimeActive = false;
 function escHtml(s){
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
@@ -131,14 +132,60 @@ function checkForUpdate(){
     loadUpdateResult(false);
 }
 
-function requestUpdateCheck(){
-    var btn = document.getElementById('btn_check_updates');
-    var status = document.getElementById('awg_update_status');
-    if(btn){ btn.disabled = true; btn.value = 'Checking...'; }
-    if(status) status.textContent = 'Contacting GitHub...';
-    document.form.action_script.value = "start_awgcheckupdate";
+var activeOperation = false;
+function submitOperation(action, done){
+    if(activeOperation) return;
+    var id = String(Date.now());
+    activeOperation = true;
+    var box = document.getElementById('awg_operation');
+    box.textContent = 'Operation in progress...';
+    var started = Date.now();
+    document.form.action_script.value = action + '_' + id;
     document.form.submit();
-    setTimeout(function(){ loadUpdateResult(true); }, 4000);
+    function poll(){
+        if(Date.now() - started > 600000){
+            activeOperation = false;
+            box.textContent = 'No completion receipt. Check LOG before retrying.';
+            return;
+        }
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/user/awg_operation_' + id + '.htm?_=' + Date.now(), true);
+        xhr.timeout = 5000;
+        var finished = false;
+        xhr.onload = function(){
+            try {
+                var result = JSON.parse(xhr.responseText);
+                if(result.id === id && (result.state === 'succeeded' || result.state === 'failed')){
+                    finished = true; activeOperation = false;
+                    box.textContent = result.state === 'succeeded' ? 'Completed' : result.message;
+                    refreshStatus();
+                    if(result.state === 'succeeded' && done) done();
+                }
+            } catch(e){}
+        };
+        xhr.onloadend = function(){ if(!finished) setTimeout(poll, 1500); };
+        xhr.send();
+    }
+    setTimeout(poll, 1000);
+}
+function validIPv4(value){
+    var parts = value.split('.');
+    return parts.length === 4 && parts.every(function(x){return /^[0-9]{1,3}$/.test(x) && Number(x) <= 255;});
+}
+function validateClientRows(){
+    var seen = {};
+    var rows = document.querySelectorAll('#awg_client_rows tr');
+    for(var i=0;i<rows.length;i++){
+        var ip=rows[i].querySelector('.client_ip').value.trim();
+        if(!ip) continue;
+        if(!validIPv4(ip) || seen[ip]){alert('Invalid or duplicate device IPv4: ' + ip);return false;}
+        seen[ip]=true;
+    }
+    return true;
+}
+
+function requestUpdateCheck(){
+    submitOperation('start_awgcheckupdate', function(){loadUpdateResult(true);});
 }
 
 function loadUpdateResult(showErrors){
@@ -197,44 +244,13 @@ function showVersionInfo(data){
 }
 
 function doUpdate(){
-    if(!confirm('Update AmneziaWG?\nVPN will be stopped. After update click Start.')) return;
-    var badge = document.getElementById('awg_badge');
-    badge.className = 'awg-status connecting';
-    badge.innerHTML = '&#9679; Updating...';
-    if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
-
-    document.form.action_script.value = "start_awgdoupdate";
-    document.form.submit();
-
-    // Wait for update to finish (VPN stopped, new version installed), then reload
-    var attempts = 0;
-    setTimeout(function(){
-        var poll = setInterval(function(){
-            attempts++;
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
-            xhr.timeout = 3000;
-            xhr.onload = function(){
-                try {
-                    var s = JSON.parse(xhr.responseText);
-                    // Update done when VPN is stopped (do_update stops it)
-                    if(!s.running || attempts >= 120){
-                        clearInterval(poll);
-                        location.reload();
-                    }
-                } catch(e){
-                    if(attempts >= 120){ clearInterval(poll); location.reload(); }
-                }
-            };
-            xhr.onerror = function(){ if(attempts >= 120){ clearInterval(poll); location.reload(); } };
-            xhr.send();
-        }, 2000);
-    }, 5000);
+    if(confirm('Install the latest package? VPN will stop; click Start after completion.'))
+        submitOperation('start_awgdoupdate', function(){location.reload();});
 }
 
 function loadSettings(){
     var fields = [
-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns',
+        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
         'awg_peer_allowedips', 'awg_peer_keepalive',
         'awg_jc', 'awg_jmin', 'awg_jmax',
@@ -269,6 +285,7 @@ function loadSettings(){
             }
         } catch(e){}
     }
+    document.getElementById('awg_autostart').checked = custom_settings.awg_autostart !== '0';
     // Load default policy
     var defPolicy = document.getElementById('default_policy');
     defPolicy.value = custom_settings.awg_default_policy || 'direct';
@@ -280,9 +297,10 @@ function loadSettings(){
     updateGeoVisibility();
 }
 
-function saveSettings(){
+function saveSettings(action){
+    if(activeOperation || !validateClientRows()) return;
     var fields = [
-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns',
+        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
         'awg_peer_allowedips', 'awg_peer_keepalive',
         'awg_jc', 'awg_jmin', 'awg_jmax',
@@ -304,6 +322,7 @@ function saveSettings(){
             custom_settings[fields[i]] = v;
         }
     }
+    custom_settings.awg_autostart = document.getElementById('awg_autostart').checked ? '1' : '0';
     // Save default policy and clients
     custom_settings.awg_default_policy = document.getElementById('default_policy').value;
     custom_settings.awg_clients = serializeClients();
@@ -336,15 +355,13 @@ function saveSettings(){
         alert('Invalid key format. Keys must be 44 characters (base64).');
         return;
     }
-    if(ep.indexOf(':') === -1){
+    if(!/^[a-zA-Z0-9.-]+:[0-9]+$/.test(ep) || Number(ep.split(':')[1]) < 1 || Number(ep.split(':')[1]) > 65535){
         alert('Endpoint must include port (e.g. server:51820).');
         return;
     }
 
     document.getElementById('amng_custom').value = JSON.stringify(custom_settings);
-    document.form.action_script.value = "start_awgsaveconf";
-    document.form.submit();
-    setTimeout(function(){ location.reload(); }, 15000);
+    submitOperation(action || 'start_awgsaveconf');
 }
 
 // === Routing: per-device with individual policies ===
@@ -358,14 +375,15 @@ function loadClients(){
     for(var i = 0; i < entries.length; i++){
         if(!entries[i]) continue;
         var parts = entries[i].split(',');
-        addClientRow(parts[0] || '', parts[1] || '', parts[2] || 'vpn_all');
+        addClientRow(parts[0] || '', parts[1] || '', parts[2] || 'vpn_all', parts[3] || '');
     }
     updateGeoVisibility();
 }
 
-function addClientRow(ip, name, policy){
+function addClientRow(ip, name, policy, mac){
     var tbody = document.getElementById('awg_client_rows');
     var tr = document.createElement('tr');
+    tr.setAttribute('data-mac', mac || '');
     policy = policy || 'vpn_all';
     tr.innerHTML =
         '<td><input type="text" class="client_ip input_25_table" value="' + escHtml(ip) + '" placeholder="192.168.1.100"></td>' +
@@ -387,7 +405,7 @@ function serializeClients(){
         var ip = rows[i].querySelector('.client_ip').value.trim();
         var name = rows[i].querySelector('.client_name').value.trim();
         var policy = rows[i].querySelector('.client_policy').value;
-        if(ip) parts.push(ip + ',' + name.replace(/[,;]/g, ' ') + ',' + policy);
+        if(ip) parts.push(ip + ',' + name.replace(/[,;]/g, ' ') + ',' + policy + ',' + (rows[i].getAttribute('data-mac') || ''));
     }
     return parts.join(';');
 }
@@ -452,6 +470,9 @@ function updateAntiFilterControls(count){
         } else if(!awgRuntimeRunning){
             status.textContent = 'Enabled; start AmneziaWG to update';
             status.style.color = '#aaa';
+        } else if(!antifilterRuntimeActive){
+            status.textContent = 'Enabled in settings; routing not ready';
+            status.style.color = '#fc0';
         } else {
             status.textContent = 'Enabled' + (count > 0 ? ' — ' + count + ' IP ranges' : '');
             status.style.color = '#9f9';
@@ -473,9 +494,7 @@ function updateAntiFilter(){
     var status = document.getElementById('antifilter_status');
     if(btn) btn.disabled = true;
     if(status){ status.textContent = 'Updating AntiFilter...'; status.style.color = '#fc0'; }
-    document.form.action_script.value = "start_awgupdateantifilter";
-    document.form.submit();
-    setTimeout(function(){ location.reload(); }, 60000);
+    submitOperation('start_awgupdateantifilter');
 }
 
 function getCheckedValues(prefix){
@@ -494,17 +513,7 @@ function setCheckedValues(prefix, csv){
 }
 
 function updateGeoLists(){
-    var btn = document.getElementById('btn_geo_update');
-    var isDownload = btn && btn.value === 'Download Lists';
-    var msg = isDownload
-        ? 'Download all GeoIP and domain lists?\nThis may take 1-2 minutes.'
-        : 'Force re-download all GeoIP and domain lists?\nThis may take 1-2 minutes.';
-    if(!confirm(msg)) return;
-    var log = document.getElementById('awg_log');
-    if(log) log.textContent = 'Downloading geo lists... Please wait.';
-    document.form.action_script.value = "start_awgupdategeo";
-    document.form.submit();
-    setTimeout(function(){ location.reload(); }, 60000);
+    if(confirm('Save current settings and download the selected Geo lists?')) saveSettings('start_awgsaveupdategeo');
 }
 
 function fetchDhcpClients(){
@@ -604,50 +613,7 @@ function addManualIPs(input){
 }
 
 function awgAction(action){
-    document.form.action_script.value = action;
-    document.form.submit();
-    var badge = document.getElementById('awg_badge');
-    var isStop = action.indexOf('stop') !== -1;
-    var expect = !isStop;
-
-    // Stop periodic refresh while action runs
-    if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
-    document.getElementById('btn_start').disabled = true;
-    document.getElementById('btn_stop').disabled = true;
-    document.getElementById('btn_restart').disabled = true;
-
-    // Show transitional status
-    badge.className = 'awg-status connecting';
-    badge.innerHTML = isStop ? '&#9679; Stopping...' : '&#9679; Connecting...';
-
-    // Poll until status is fully ready
-    var attempts = 0;
-    var poll = setInterval(function(){
-        attempts++;
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
-        xhr.timeout = 3000;
-        xhr.onload = function(){
-            try {
-                var s = JSON.parse(xhr.responseText);
-                // For start: wait until running AND has public key (fully ready)
-                // For stop: wait until not running
-                var ready = (s.running === expect);
-                if(ready || attempts >= 90){
-                    clearInterval(poll);
-                    updateStatusUI(s);
-                    statusTimer = setInterval(refreshStatus, 5000);
-                    document.getElementById('btn_start').disabled = false;
-                    document.getElementById('btn_stop').disabled = false;
-                    document.getElementById('btn_restart').disabled = false;
-                }
-            } catch(e){
-                if(attempts >= 90){ clearInterval(poll); refreshStatus(); document.getElementById('btn_start').disabled = false; document.getElementById('btn_stop').disabled = false; document.getElementById('btn_restart').disabled = false; }
-            }
-        };
-        xhr.onerror = function(){ if(attempts >= 90){ clearInterval(poll); refreshStatus(); document.getElementById('btn_start').disabled = false; document.getElementById('btn_stop').disabled = false; document.getElementById('btn_restart').disabled = false; } };
-        xhr.send();
-    }, 2000);
+    submitOperation(action);
 }
 
 function showLoading(){}
@@ -675,6 +641,7 @@ function refreshStatus(){
 }
 
 function updateStatusUI(s){
+    if(!s.measured_at || Date.now()/1000 - s.measured_at > 30){setOfflineUI();return;}
     var badge = document.getElementById('awg_badge');
     var info = document.getElementById('awg_info');
     var peers = document.getElementById('awg_peers');
@@ -691,7 +658,8 @@ function updateStatusUI(s){
 
     if(s.running){
         badge.className = 'awg-status running';
-        badge.innerHTML = '&#9679; Connected';
+        badge.textContent = s.state === 'handshake_recent' ? 'Recent handshake' : 'Interface up; waiting for handshake';
+        if(s.state !== 'handshake_recent') badge.className = 'awg-status connecting';
         document.getElementById('btn_start').style.display = 'none';
         document.getElementById('btn_stop').style.display = '';
         document.getElementById('btn_restart').style.display = '';
@@ -706,8 +674,9 @@ function updateStatusUI(s){
     if(s.antifilter_enabled !== undefined){
         antifilterRuntimeEnabled = !!s.antifilter_enabled;
     }
+    antifilterRuntimeActive = !!s.antifilter_active;
     updateAntiFilterControls(parseInt(s.antifilter_count || 0, 10));
-    antiFilterSettingChanged();
+    if(document.getElementById('antifilter_enabled').checked !== antifilterRuntimeEnabled) antiFilterSettingChanged();
 
     info.innerHTML = '';
     if(s.interface_addr) info.innerHTML += 'Address: ' + escHtml(s.interface_addr) + '<br>';
@@ -729,6 +698,7 @@ function updateStatusUI(s){
     peers.innerHTML = html;
 
     if(s.log) logbox.textContent = s.log;
+    if(s.geo_warnings > 0) info.innerHTML += '<br>GeoSite conversion warnings: ' + Number(s.geo_warnings) + ' (see LOG).';
 
     // Route info
     var rulesEl = document.getElementById('awg_active_rules');
@@ -758,7 +728,7 @@ function updateStatusUI(s){
 function setOfflineUI(){
     var badge = document.getElementById('awg_badge');
     badge.className = 'awg-status stopped';
-    badge.innerHTML = '&#9679; Stopped';
+    badge.innerHTML = 'Status unavailable / stale';
     document.getElementById('btn_start').style.display = '';
     document.getElementById('btn_stop').style.display = 'none';
     document.getElementById('btn_restart').style.display = 'none';
@@ -983,6 +953,7 @@ function initAutocompleteIp(){
 <div id="Loading" class="popup_bg"></div>
 <iframe name="hidden_frame" id="hidden_frame" src="about:blank" width="0" height="0" frameborder="0"></iframe>
 
+<div id="awg_operation" role="status" style="padding:10px;color:#fc0;"></div>
 <form method="post" name="form" id="ruleForm" action="/start_apply.htm" target="hidden_frame">
 <input type="hidden" name="productid" value="<% nvram_get("productid"); %>">
 <input type="hidden" name="current_page" value="">
@@ -1088,9 +1059,10 @@ function initAutocompleteIp(){
                     <td><input type="text" class="input_6_table" id="awg_listenport" maxlength="5" placeholder="51820"></td>
                 </tr>
                 <tr>
-                    <th>DNS</th>
-                    <td><input type="text" class="input_20_table" id="awg_dns" maxlength="64" placeholder="1.1.1.1"></td>
+                    <th>DNS for selected domains (IPv4)</th>
+                    <td><input type="text" class="input_20_table" id="awg_dns" maxlength="64" placeholder="Blank: router DNS"></td>
                 </tr>
+<tr><th>Router startup</th><td><label><input type="checkbox" id="awg_autostart"> Start AmneziaWG after reboot</label></td></tr>
                 </table>
 
                 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable" style="margin-top:8px;">
@@ -1267,6 +1239,7 @@ function initAutocompleteIp(){
                         <span style="color:#888; font-size:11px; margin-left:8px;">Uses MYAWG, mark 0x66 and table 400. Enabled by default.</span>
                     </td>
                 </tr>
+<tr><th>Incoming VPN source networks</th><td><input type="text" class="input_32_table" id="awg_vpn_source_nets" placeholder="10.8.0.0/24,10.10.10.0/24"><br>IPv4 CIDRs, comma-separated. Blank uses the defaults shown.</td></tr>
                 <tr>
                     <th>List Update</th>
                     <td>
@@ -1278,6 +1251,7 @@ function initAutocompleteIp(){
 
                 <!-- ==================== GEO ROUTING ==================== -->
                 <div id="geo_section" style="display:none;">
+<p style="color:#fc0">IPv4 routing only. Native WAN IPv6 is not routed by this addon. Use router DNS on LAN and incoming VPN clients; encrypted DNS can bypass domain selection. GeoSite domain/full entries use DNS suffix matching; keyword/regexp entries are reported and skipped. Existing connections may need reconnecting after policy changes.</p>
 
                 <div style="border:1px solid #fc0; border-radius:4px; padding:10px 14px; margin-top:10px; font-size:12px; color:#fc0;">
                     <b>Важно:</b> Для работы VPN Geo устройства должны использовать роутер как DNS-сервер.<br>

@@ -9,8 +9,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+bash tests/run.sh
+
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-17"
+PKG_VERSION="2.2.0-18"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
@@ -58,7 +60,7 @@ Version: ${PKG_VERSION}
 Section: net
 Architecture: ${arch}
 Maintainer: amneziawg-merlin
-Source: https://github.com/r0otx/asuswrt-merlin-amneziawg
+Source: https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1
 Description: AmneziaWG VPN for Asuswrt-Merlin
  DPI-obfuscated WireGuard VPN with per-device policy routing
  and GeoIP/GeoSite selective routing for ASUS routers.
@@ -83,17 +85,17 @@ mkdir -p /dev/net
 mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
 chmod 600 /dev/net/tun 2>/dev/null || true
 if [ -f /usr/sbin/helper.sh ]; then
-    /jffs/addons/amneziawg/amneziawg.sh install_page || true
+    /jffs/addons/amneziawg/amneziawg.sh install_page
 fi
 if grep -q '^awg_privatekey ' /jffs/addons/custom_settings.txt 2>/dev/null; then
-    /jffs/addons/amneziawg/amneziawg.sh service_event package awgsaveconf || true
+    /jffs/addons/amneziawg/amneziawg.sh service_event package awgsaveconf
 fi
 echo ""
 echo "============================================"
 echo "  AmneziaWG installed!"
 echo "============================================"
 echo "  Web UI:  VPN > AmneziaWG"
-echo "  Start:   /opt/etc/init.d/S99amneziawg start"
+echo "  Start:   /jffs/addons/amneziawg/amneziawg.sh start"
 echo ""
 POSTEOF
     chmod 755 "$CONTROL_DIR/postinst"
@@ -133,6 +135,8 @@ PRERMEOF
     printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
     cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
     cp addon/awg-ipset-update.sh      "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
+    cp addon/awg-common.sh          "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
+    cp addon/awg-runtime.sh         "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
     cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 
     chmod 755 "$DATA_DIR/opt/amneziawg/amneziawg-go"
@@ -150,7 +154,7 @@ PRERMEOF
 
 case "$1" in
     start)
-        /jffs/addons/amneziawg/amneziawg.sh start
+        /jffs/addons/amneziawg/amneziawg.sh boot_start
         ;;
     stop)
         /jffs/addons/amneziawg/amneziawg.sh stop
@@ -185,13 +189,13 @@ echo "=== AmneziaWG .ipk builder ==="
 echo ""
 
 # Build aarch64 (ARM64) — GT-AX11000, RT-AX86U, RT-AX88U, etc.
-build_ipk "aarch64-3.10" "output/amneziawg-go" "output/awg" || true
+build_ipk "aarch64-3.10" "output/amneziawg-go" "output/awg"
 
 # Build arm (ARM32, GOARM=5) — RT-AC68U, RT-AC66U, older ARM routers
-build_ipk "armv7-2.6" "output/amneziawg-go-arm5" "output/awg-arm" || true
+if [ -f output/amneziawg-go-arm5 ]; then build_ipk "armv7-2.6" "output/amneziawg-go-arm5" "output/awg-arm"; fi
 
 # Build arm (ARM32, newer Entware/HND) — RT-AX56U, RT-AX58U, etc.
-build_ipk "armv7-3.2" "output/amneziawg-go-arm" "output/awg-arm" || true
+if [ -f output/amneziawg-go-arm ]; then build_ipk "armv7-3.2" "output/amneziawg-go-arm" "output/awg-arm"; fi
 
 echo ""
 echo "Done. Install on router:"

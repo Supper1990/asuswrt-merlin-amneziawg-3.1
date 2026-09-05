@@ -127,15 +127,15 @@ managed_firewall_rules
             stubs = '\n'.join(name + '(){ :; }' for name in ('cleanup_firewall', 'prune_unselected_geoip_lists',
                 'selected_geoip_services', 'save_clients', 'setup_dns_interception', 'restart_dnsmasq_and_wait',
                 'flush_conntrack', 'save_and_set_rp_filter', 'ensure_ui_mark_nat', 'repair_aux_routing',
-                'register_managed_cron', 'managed_firewall_rules', 'log_msg'))
-            r = self.run_shell(functions(MAIN, 'setup_firewall') + '\n' + stubs + r'''
+                'register_managed_cron', 'managed_firewall_rules', 'log_msg', 'ensure_main_routes', 'ensure_base_firewall', 'dnsmasq'))
+            r = self.run_shell(functions(MAIN, 'setup_firewall_body') + '\n' + stubs + r'''
 get_setting(){ [ "$1" = awg_default_policy ] && echo vpn_all; }
 get_lan_net(){ echo 192.168.50.0/24; }
 get_endpoint(){ echo 203.0.113.1; }
 ipset(){ [ "$1" = list ] && echo 'Number of entries: 0'; return 0; }
 ip(){ echo "$*" >> "$TRACE"; }
 iptables(){ echo "$*" >> "$TRACE"; }
-setup_firewall
+setup_firewall_body
 ''', env)
             self.assertEqual(r.stderr, '')
             trace = Path(env['TRACE']).read_text().splitlines()
@@ -153,6 +153,7 @@ setup_firewall
                 Path(d, 'awg0.addr').write_text('10.8.1.10/32')
                 r = self.run_shell(functions(MAIN, 'do_service_event') + '''
 get_setting(){ echo present; }
+validate_runtime_settings(){ :; }
 generate_config(){ [ "$CHANGED" = yes ] && echo new > "$CONF"; return 0; }
 is_running(){ return 0; }
 update_geo_if_needed(){ :; }
