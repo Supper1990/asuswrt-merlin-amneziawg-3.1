@@ -125,6 +125,7 @@ operation_write 123 succeeded Apply
                  'IPSET_MIN_COUNT_FILE':d+'/min','FIREWALL_EXPECTED':d+'/expected','TRACE':d+'/trace'}
             result=self.shell(functions(RUNTIME,'setup_firewall').replace('iptables-save','iptables_save')+'''
 validate_runtime_settings(){ :; }
+find_external_program(){ echo /bin/true; }
 cancel_prefill(){ :; }
 preflight_geo(){ :; }
 prune_unselected_geoip_lists(){ :; }

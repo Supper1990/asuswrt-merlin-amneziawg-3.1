@@ -283,3 +283,7 @@ Offline checks: `python3 tests/test_recovery.py` (mock system commands; router v
 List validation before application, rollback on detected runtime errors, complete AntiFilter membership checks, operation receipts in the UI, live status, MAC preservation, consistent autostart and package updates with a verified rollback package. The DNS field applies to selected domains. The global connection table is no longer flushed.
 
 See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitations and router acceptance checks. Packaging runs `bash tests/run.sh` (Python 3; the browser test also uses Node.js). Docker builds are not guaranteed to be byte-for-byte reproducible.
+
+### Startup fix in 2.2.0-19
+
+A router running 2.2.0-18 reported `command: not found` from the firewall wrapper. The addon now resolves external `ip` and `iptables` executables from PATH before wrapping them and invokes their absolute paths. Required-operation failure checks remain active; command failure messages and regression tests without `command` are included.

@@ -73,10 +73,30 @@ preflight_geo(){
     done
 }
 
+# Some Merlin BusyBox shells omit the `command` builtin. Resolve the external
+# programs before defining same-name wrappers; never recurse into a wrapper.
+find_external_program(){
+    local name="$1" remaining="$PATH" dir
+    case "$name" in ''|*/*) return 1;; esac
+    while :; do
+        dir=${remaining%%:*}
+        [ -n "$dir" ] || dir=.
+        case "$dir" in /*) ;; *) dir="$PWD/$dir";; esac
+        if [ -f "$dir/$name" ] && [ -x "$dir/$name" ]; then
+            printf '%s\n' "$dir/$name"
+            return 0
+        fi
+        case "$remaining" in *:*) remaining=${remaining#*:};; *) break;; esac
+    done
+    return 1
+}
+
 setup_firewall(){
     validate_runtime_settings || return 1
     cancel_prefill || return 1
-    local txn original_geo had_set=0 rc
+    local txn original_geo had_set=0 rc awg_ip_exec awg_iptables_exec
+    awg_ip_exec=$(find_external_program ip) || { log_msg 'ERROR: ip executable not found'; return 1; }
+    awg_iptables_exec=$(find_external_program iptables) || { log_msg 'ERROR: iptables executable not found'; return 1; }
     txn=$(mktemp -d /tmp/awg_apply.XXXXXX) || return 1
     original_geo="$GEO_DIR"
     mkdir -p "$txn/geo/geoip" "$txn/geo/domains"
@@ -102,17 +122,19 @@ setup_firewall(){
         # Expected absence checks/deletions may fail; creation of required
         # rules, addresses and routes must not be converted into success.
         iptables(){
-            command iptables "$@"; code=$?
-            case " $* " in *' -A '*|*' -I '*) [ "$code" = 0 ] || exit 42;; esac
+            local code
+            "$awg_iptables_exec" "$@"; code=$?
+            case " $* " in *' -A '*|*' -I '*) [ "$code" = 0 ] || { log_msg "ERROR: iptables rule failed (exit $code): $*"; exit 42; };; esac
             return "$code"
         }
         ip(){
-            command ip "$@"; code=$?
-            case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || exit 42;; esac
+            local code
+            "$awg_ip_exec" "$@"; code=$?
+            case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || { log_msg "ERROR: ip operation failed (exit $code): $*"; exit 42; };; esac
             return "$code"
         }
-        setup_firewall_body || exit 1
-        main_firewall_base_healthy || exit 1
+        setup_firewall_body || { log_msg 'ERROR: firewall setup did not complete'; exit 1; }
+        main_firewall_base_healthy || { log_msg 'ERROR: firewall verification did not pass'; exit 1; }
     )
     rc=$?
     if [ "$rc" != 0 ]; then
