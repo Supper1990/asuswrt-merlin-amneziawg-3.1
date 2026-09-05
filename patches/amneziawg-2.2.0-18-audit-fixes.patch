@@ -1,0 +1,2448 @@
+diff --git a/.gitignore b/.gitignore
+index 1987f52..8337da8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,3 +6,5 @@ kernel.config
+ .DS_Store
+ asuswrt-merlin-xrayui
+ article_habr.md
++
++__pycache__/
+diff --git a/README.md b/README.md
+index 75492e9..3ef290e 100644
+--- a/README.md
++++ b/README.md
+@@ -277,3 +277,9 @@ MIT License
+ Ограничение: аддон управляет IPv4; прямой выход через WAN по IPv6 не блокируется. При включённом IPv6 журнал предупреждает об этом. Проверка наличия правил не гарантирует отсутствие конфликтующих правил других аддонов.
+ 
+ Проверки без роутера: `python3 tests/test_recovery.py` (имитация системных команд; не заменяет проверку на Merlin).
++
++### Исправления 2.2.0-18
++
++Проверка списков до применения, восстановление при ошибках, полный контроль состава AntiFilter, квитанции операций в интерфейсе, живой статус, сохранение MAC, единый автозапуск и обновление пакета с проверенным пакетом отката. Поле DNS применяется к выбранным доменам. Общая таблица соединений больше не очищается.
++
++Проверки, ограничения GeoSite/IPv6 и порядок приёмки: [docs/AUDIT-18.md](docs/AUDIT-18.md). Перед упаковкой выполняется `bash tests/run.sh` (Python 3; браузерный тест дополнительно использует Node.js). Побитовая воспроизводимость Docker-сборки не гарантируется.
+diff --git a/README_EN.md b/README_EN.md
+index c479a42..51fcc5e 100644
+--- a/README_EN.md
++++ b/README_EN.md
+@@ -277,3 +277,9 @@ MIT License
+ Limitations: routing is IPv4-only; native IPv6 WAN traffic is not blocked. A warning replaces the misleading protection message. Rule-presence checks do not guarantee absence of conflicting third-party rules.
+ 
+ Offline checks: `python3 tests/test_recovery.py` (mock system commands; router validation is still required).
++
++### Changes in 2.2.0-18
++
++List validation before application, rollback on detected runtime errors, complete AntiFilter membership checks, operation receipts in the UI, live status, MAC preservation, consistent autostart and package updates with a verified rollback package. The DNS field applies to selected domains. The global connection table is no longer flushed.
++
++See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitations and router acceptance checks. Packaging runs `bash tests/run.sh` (Python 3; the browser test also uses Node.js). Docker builds are not guaranteed to be byte-for-byte reproducible.
+diff --git a/addon/amneziawg.sh b/addon/amneziawg.sh
+index 78dbd50..abab9db 100755
+--- a/addon/amneziawg.sh
++++ b/addon/amneziawg.sh
+@@ -34,8 +34,14 @@ V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/t
+ # Ensure Entware binaries are in PATH (not set when called from httpd/service-event)
+ export PATH="/opt/bin:/opt/sbin:$PATH"
+ 
++. "${AWG_COMMON_PATH:-$ADDON_DIR/awg-common.sh}" || exit 1
++
+ # --- Helpers ---
+ 
++autostart_enabled(){
++    [ "$(get_setting awg_autostart)" != "0" ]
++}
++
+ log_msg(){
+     logger -t "$SCRIPT_NAME" "$1"
+ }
+@@ -72,7 +78,7 @@ repair_aux_routing(){
+     [ -x "$AUX_IPSET_SCRIPT" ] || return 0
+     if ! antifilter_enabled; then
+         "$AUX_IPSET_SCRIPT" --disable 2>/dev/null
+-        return 0
++        return $?
+     fi
+     "$AUX_IPSET_SCRIPT" --repair || {
+         log_msg "WARNING: MYAWG table 400 repair failed"
+@@ -151,17 +157,16 @@ get_endpoint(){
+ ensure_main_routes(){
+     local lan_net
+     lan_net=$(get_lan_net)
+-    ip route replace 0.0.0.0/1 dev "$IFACE" table $RT_TABLE
+-    ip route replace 128.0.0.0/1 dev "$IFACE" table $RT_TABLE
+-    [ -n "$lan_net" ] && ip route replace "$lan_net" dev br0 table $RT_TABLE
++    ip route replace 0.0.0.0/1 dev "$IFACE" table $RT_TABLE || return 1
++    ip route replace 128.0.0.0/1 dev "$IFACE" table $RT_TABLE || return 1
++    if [ -n "$lan_net" ]; then ip route replace "$lan_net" dev br0 table $RT_TABLE || return 1; fi
+     ip route flush cache 2>/dev/null
+ }
+ 
+ flush_conntrack(){
+-    if command -v conntrack >/dev/null 2>&1 && conntrack -D --mark "$FWMARK"/"$FWMARK" 2>/dev/null; then
+-        return 0
+-    fi
+-    conntrack -F 2>/dev/null
++    # Never clear the router-wide connection table. Packet marks are not
++    # connection marks; deleting by our packet mark is not a safe selector.
++    return 0
+ }
+ 
+ save_and_set_rp_filter(){
+@@ -195,7 +200,7 @@ restore_rp_filter(){
+     done
+ }
+ 
+-main_firewall_healthy(){
++main_firewall_base_healthy(){
+     local lan_net min_ipset_count current_ipset_count
+ 
+     lan_net=$(get_lan_net)
+@@ -296,35 +301,6 @@ restart_dnsmasq_and_wait(){
+ # Resolve configured domains after Apply without blocking the web request.
+ # dnsmasq adds the resulting addresses to awg_dst. Only one prefill job is
+ # allowed at a time; /tmp is cleared on reboot if a job is interrupted.
+-pre_resolve_domains_async(){
+-    [ -s "$DNSMASQ_AWG_CONF" ] || return 0
+-
+-    (
+-        if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
+-            log_msg "Domain pre-resolution already running"
+-            exit 0
+-        fi
+-        trap 'rm -rf "$DNS_PREFILL_LOCK"' 0 1 2 15
+-
+-        local total bg_count domain_file
+-        domain_file="$DNS_PREFILL_LOCK/domains"
+-        awk -F/ '/^ipset=/{for(i=2;i<NF;i++) if($i!="") print $i}' \
+-            "$DNSMASQ_AWG_CONF" > "$domain_file"
+-        total=$(wc -l < "$domain_file" | tr -d ' ')
+-        log_msg "Domain pre-resolution started: $total domains"
+-
+-        bg_count=0
+-        while read -r domain; do
+-            [ -z "$domain" ] && continue
+-            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
+-            bg_count=$((bg_count + 1))
+-            [ "$bg_count" -ge 10 ] && { wait; bg_count=0; }
+-        done < "$domain_file"
+-        wait
+-
+-        log_msg "Domain pre-resolution finished: $total domains"
+-    ) </dev/null >/dev/null 2>&1 &
+-}
+ 
+ # Wait for network interface IP. Usage: wait_for_iface_ip <iface> <timeout>
+ wait_for_iface_ip(){
+@@ -446,10 +422,12 @@ download_geoip_service(){
+     valid_geo_service_name "$svc" || return 1
+     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
+     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+-        grep -v ":" "$tmp" > "$GEO_DIR/geoip/v2fly_${svc}.cidr"
+-        rm -f "$tmp"
+-        [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] || { rm -f "$GEO_DIR/geoip/v2fly_${svc}.cidr"; return 1; }
+-        return 0
++        if normalize_cidrs "$tmp" "$tmp.valid" 1; then
++            mv "$tmp.valid" "$GEO_DIR/geoip/v2fly_${svc}.cidr" || return 1
++            rm -f "$tmp"
++            return 0
++        fi
++        log_msg "ERROR: Invalid GeoIP response for $svc; cached list retained"
+     fi
+     rm -f "$tmp"
+     return 1
+@@ -490,7 +468,7 @@ download_all_geo(){
+     local tmp_yml="$GEO_DIR/v2fly_all.yml.tmp"
+     if curl -sfL --connect-timeout 10 --max-time 120 "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat_plain.yml" \
+         -o "$tmp_yml" 2>/dev/null; then
+-        if [ -s "$tmp_yml" ]; then
++        if [ -s "$tmp_yml" ] && awk '/^[[:space:]]*- name:/{names++} /"(domain|full):/{rules++} END{exit !(names>0 && rules>0)}' "$tmp_yml"; then
+             mv "$tmp_yml" "$GEO_DIR/v2fly_all.yml"
+             grep -E '^[[:space:]]*- name:' "$GEO_DIR/v2fly_all.yml" | \
+                 sed 's/.*- name:[[:space:]]*//;s/^"//;s/"$//' | \
+@@ -614,13 +592,13 @@ cleanup_firewall(){
+     rm -f "$DNSMASQ_AWG_CONF"
+     [ -f "$DNSMASQ_INCLUDE" ] && sed -i "\|${DNSMASQ_AWG_CONF}|d" "$DNSMASQ_INCLUDE"
+ 
+-    cleanup_ipv6_block
+-
+     log_msg "Firewall rules cleaned"
+ }
+ 
+-setup_firewall(){
++setup_firewall_body(){
+     cleanup_firewall
++    ensure_main_routes || return 1
++    ensure_base_firewall || return 1
+ 
+     local default_policy=$(get_setting awg_default_policy)
+     [ -z "$default_policy" ] && default_policy="direct"
+@@ -630,7 +608,7 @@ setup_firewall(){
+     ipset create "$IPSET_NAME" hash:net family inet hashsize 4096 maxelem 131072 timeout 86400 2>/dev/null
+     if ! ipset list "$IPSET_NAME" >/dev/null 2>&1; then
+         log_msg "ERROR: ipset $IPSET_NAME creation failed, geo routing disabled"
+-        has_geo=false
++        return 1
+     fi
+ 
+     # --- Load selected GeoIP subnets into ipset (bulk) ---
+@@ -641,7 +619,7 @@ setup_firewall(){
+     for svc in $selected_services; do
+         f="$GEO_DIR/geoip/v2fly_${svc}.cidr"
+         [ ! -f "$f" ] && continue
+-        ipset_load_file "$f" "$IPSET_NAME"
++        ipset_load_file "$f" "$IPSET_NAME" || return 1
+         ip_count=$((ip_count + $(wc -l < "$f")))
+     done
+ 
+@@ -649,7 +627,7 @@ setup_firewall(){
+     for f in "$GEO_DIR"/geoip/*.cidr; do
+         [ ! -f "$f" ] && continue
+         case "${f##*/}" in v2fly_*.cidr) continue ;; esac
+-        ipset_load_file "$f" "$IPSET_NAME"
++        ipset_load_file "$f" "$IPSET_NAME" || return 1
+         ip_count=$((ip_count + $(wc -l < "$f")))
+     done
+ 
+@@ -661,15 +639,17 @@ setup_firewall(){
+ 
+     # --- Extract v2fly domains from downloaded database ---
+     local geo_v2fly=$(get_setting awg_geo_v2fly)
++    : > "$GEO_DIR/domains/warnings.txt"
+     rm -f "$GEO_DIR/domains/v2fly_"*.txt
+     if [ -n "$geo_v2fly" ] && [ -f "$GEO_DIR/v2fly_all.yml" ]; then
+         for svc in $(echo "$geo_v2fly" | tr ',' ' '); do
+             svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+-            valid_geo_service_name "$svc" || {
++            valid_geosite_name "$svc" || {
+                 log_msg "WARNING: Invalid GeoSite category: $svc"
+                 continue
+             }
+-            awk -v cat="$svc" '
++            awk -v cat="$svc" -v warnings="$GEO_DIR/domains/warnings.txt" '
++                BEGIN{split(cat,sel,"@");cat=sel[1];attr=sel[2]}
+                 /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
+                     name=$0
+                     sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name)
+@@ -681,9 +661,12 @@ setup_firewall(){
+                     rule=$0
+                     sub(/^[[:space:]]*-[[:space:]]*/, "", rule)
+                     sub(/^"/, "", rule); sub(/"[[:space:]]*$/, "", rule)
++                    if (attr!="" && index(rule, ":@" attr)==0)next
++                    if (rule ~ /^(keyword|regexp):/) {print cat ": unsupported " rule >> warnings; next}
++                    if (rule ~ /^full:/) {print cat ": full domain includes subdomains in dnsmasq: " rule >> warnings}
+                     if (rule ~ /^(domain|full):/) {
+                         sub(/^[^:]*:/, "", rule)
+-                        sub(/:@[^:]*$/, "", rule)
++                        sub(/:@.*/, "", rule)
+                         if (rule != "") print rule
+                     }
+                 }
+@@ -695,6 +678,10 @@ setup_firewall(){
+         done
+     fi
+ 
++    if [ -s "$GEO_DIR/domains/warnings.txt" ]; then
++        log_msg "WARNING: GeoSite conversion limitations: $(wc -l < "$GEO_DIR/domains/warnings.txt") rules; see status"
++    fi
++
+     # --- Save custom domains/IPs ---
+     local custom_domains=$(get_setting awg_geo_custom_domains)
+     if [ -n "$custom_domains" ]; then
+@@ -708,8 +695,8 @@ setup_firewall(){
+         mkdir -p "$GEO_DIR/geoip"
+         echo "$custom_ips" | tr ',' '\n' | while read -r cidr; do
+             cidr=$(echo "$cidr" | tr -d ' \r')
+-            [ -n "$cidr" ] && ipset add "$IPSET_NAME" "$cidr" timeout 0 2>/dev/null
+-        done
++            [ -n "$cidr" ] && ipset add "$IPSET_NAME" "$cidr" timeout 0 -exist 2>/dev/null || exit 1
++        done || return 1
+     fi
+ 
+     # Save a conservative floor for static GeoIP/Custom IP entries. Dynamic
+@@ -751,6 +738,20 @@ setup_firewall(){
+         [ $chunk_count -gt 0 ] && echo "${chunk_line}${IPSET_NAME}" >> "$DNSMASQ_AWG_CONF"
+     done
+ 
++    local selected_dns
++    selected_dns=$(get_setting awg_dns)
++    if [ -n "$selected_dns" ]; then
++        awk -F/ '/^ipset=/{for(i=2;i<NF;i++)if($i!="")print $i}' "$DNSMASQ_AWG_CONF" | sort -u |
++        while IFS= read -r domain; do
++            for server_ip in $(printf '%s' "$selected_dns" | tr ',' ' '); do
++                printf 'server=/%s/%s\n' "$domain" "$server_ip"
++            done
++        done > "$DNSMASQ_AWG_CONF.servers"
++        cat "$DNSMASQ_AWG_CONF.servers" >> "$DNSMASQ_AWG_CONF"
++        rm -f "$DNSMASQ_AWG_CONF.servers"
++    fi
++    dnsmasq --test --conf-file="$DNSMASQ_AWG_CONF" >/dev/null 2>&1 || { log_msg "ERROR: generated DNS config rejected"; return 1; }
++
+     # Add conf-file include to dnsmasq (idempotent)
+     if [ $domain_count -gt 0 ]; then
+         if ! grep -qF "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE" 2>/dev/null; then
+@@ -875,28 +876,29 @@ setup_firewall(){
+     fi
+ 
+     # --- Restart dnsmasq if geo active ---
+-    if [ $domain_count -gt 0 ] || [ "$has_geo" = true ]; then
+-        restart_dnsmasq_and_wait 15
++    if true; then
++        restart_dnsmasq_and_wait 15 || return 1
+     fi
+ 
+-    # --- Always flush conntrack so devices reconnect through VPN ---
++    # Existing unrelated sessions are retained. Selective invalidation only.
+     flush_conntrack
+ 
+     # Keep both independent routing systems healthy after every firewall rebuild.
+     save_and_set_rp_filter
+-    ensure_ui_mark_nat
++    ensure_ui_mark_nat || return 1
+     local source_addr
+     source_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+     [ -n "$source_addr" ] && ip rule add from "$source_addr" lookup $RT_TABLE prio 100
+-    repair_aux_routing
+     register_managed_cron
+ 
+     managed_firewall_rules > "$FIREWALL_EXPECTED"
++    ip_count=$(ipset list "$IPSET_NAME" -t | awk '/Number of entries/{print $NF}')
++    domain_count=$(awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i}' "$DNSMASQ_AWG_CONF" | sort -u | wc -l)
+     log_msg "Firewall configured: $ip_count IPs, $domain_count domains"
+ 
+     # Populate dynamic domain addresses after the rules are active. Do not
+     # make Apply wait for hundreds of DNS queries or their timeouts.
+-    [ "$domain_count" -gt 0 ] && pre_resolve_domains_async
++    return 0
+ }
+ 
+ save_clients(){
+@@ -925,15 +927,15 @@ update_geo_if_needed(){
+ 
+     # Apply must be sufficient when a category is deselected.  Prune before
+     # downloading missing selections and before setup_firewall runs.
+-    prune_unselected_geoip_lists "$selected_services"
++    # Prune only during validated Apply.
+ 
+     for svc in $selected_services; do
+         [ -s "$GEO_DIR/geoip/v2fly_${svc}.cidr" ] && continue
+         log_msg "GeoIP: downloading newly selected $svc..."
+-        download_geoip_service "$svc" || log_msg "WARNING: GeoIP $svc download failed"
++        download_geoip_service "$svc" || { log_msg "ERROR: GeoIP $svc download failed"; return 1; }
+     done
+     if [ -n "$(get_setting awg_geo_v2fly)" ] && [ ! -s "$GEO_DIR/v2fly_all.yml" ]; then
+-        log_msg "WARNING: GeoSite database not downloaded. Use Update Now in web UI."
++        download_all_geo || return 1
+     fi
+ }
+ 
+@@ -957,6 +959,8 @@ validate_endpoint(){
+     echo "$port" | grep -qE '^[0-9]+$' || { log_msg "ERROR: Invalid endpoint port: $1"; return 1; }
+     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null || { log_msg "ERROR: Endpoint port out of range: $port"; return 1; }
+     [ -n "$host" ] || { log_msg "ERROR: Empty endpoint host"; return 1; }
++    case "$host" in *:*|*\[*|*\]*) log_msg "ERROR: IPv6 endpoint unsupported; use IPv4 or a hostname"; return 1;; esac
++    valid_domain "$host" || return 1
+     return 0
+ }
+ 
+@@ -986,8 +990,7 @@ validate_uint_or_range() {
+ }
+ 
+ validate_ip(){
+-    echo "$1" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || return 1
+-    return 0
++    valid_ipv4 "$1"
+ }
+ 
+ # --- Generate awg0.conf ---
+@@ -1110,9 +1113,9 @@ generate_config(){
+     chmod 600 "$CONF"
+ 
+     local address=$(get_setting awg_address)
+-    [ -n "$address" ] && echo "$address" > "$AWG_DIR/awg0.addr"
++    if [ -n "$address" ]; then printf '%s\n' "$address" > "$AWG_DIR/awg0.addr"; else rm -f "$AWG_DIR/awg0.addr"; fi
+     local dns=$(get_setting awg_dns)
+-    [ -n "$dns" ] && echo "$dns" > "$AWG_DIR/awg0.dns"
++    rm -f "$AWG_DIR/awg0.dns" # DNS is generated in dnsmasq_awg.conf.
+ 
+     log_msg "Config saved"
+     return 0
+@@ -1126,8 +1129,8 @@ do_start(){
+ 
+     if is_running; then
+         log_msg "Already running"
+-        ensure_ui_mark_nat
+-        repair_aux_routing
++        ensure_ui_mark_nat || return 1
++        repair_aux_routing || return 1
+         register_managed_cron
+         update_status
+         return 0
+@@ -1145,6 +1148,8 @@ do_start(){
+ 
+     acquire_lock || { log_msg "Cannot acquire lock, aborting start"; update_status; return 1; }
+ 
++    validate_runtime_settings || return 1
++    update_geo_if_needed || return 1
+     generate_config || { update_status; release_lock; return 1; }
+     [ ! -f "$CONF" ] && { log_msg "ERROR: No config"; update_status; release_lock; return 1; }
+     [ ! -f "$AWG_GO" ] && { log_msg "ERROR: amneziawg-go not found"; update_status; release_lock; return 1; }
+@@ -1178,7 +1183,7 @@ do_start(){
+     gw=$(ip route | awk '/^default/{print $3; exit}')
+     endpoint=$(get_endpoint)
+     [ -n "$endpoint" ] && [ -n "$gw" ] && ip route add "$endpoint" via "$gw" 2>/dev/null
+-    ensure_main_routes
++    ensure_main_routes || return 1
+ 
+     save_and_set_rp_filter
+ 
+@@ -1195,7 +1200,7 @@ do_start(){
+         iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE
+     fi
+ 
+-    setup_firewall
++    setup_firewall || { do_stop; return 1; }
+ 
+     log_msg "Started, verifying tunnel connectivity..."
+     update_status
+@@ -1220,6 +1225,7 @@ do_start(){
+         do_stop 2>/dev/null
+         log_msg "VPN stopped automatically. Check server config and endpoint reachability."
+         update_status
++        return 1
+     fi
+ }
+ 
+@@ -1228,6 +1234,8 @@ do_start(){
+ do_stop(){
+     acquire_lock || { log_msg "Cannot acquire lock, aborting stop"; return 1; }
+ 
++    cancel_prefill || return 1
++    rm -f /tmp/.awg_static_members /tmp/.awg_dns_expected /tmp/.awg_dns_pending
+     remove_managed_cron
+     if [ "${WATCHDOG_RECOVERY:-0}" = "1" ]; then
+         cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+@@ -1277,78 +1285,6 @@ do_stop(){
+ 
+ # --- Status JSON for web UI ---
+ 
+-update_status(){
+-    local running=false
+-    local pub_key=""
+-    local listen_port=""
+-    local iface_addr=""
+-    local peers_json="[]"
+-    local log_text=""
+-
+-    if is_running; then
+-        running=true
+-        iface_addr=$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+-        listen_port=$("$AWG_BIN" show "$IFACE" listen-port 2>/dev/null)
+-        pub_key=$("$AWG_BIN" show "$IFACE" public-key 2>/dev/null)
+-
+-        local dump=$("$AWG_BIN" show "$IFACE" dump 2>/dev/null | tail -n +2)
+-        if [ -n "$dump" ]; then
+-            local p_items=""
+-            while IFS='	' read -r pkey psk endpoint aips handshake rx tx keepalive; do
+-                local hs_text="never"
+-                if [ "$handshake" != "0" ] && [ -n "$handshake" ]; then
+-                    local ago=$(( $(date +%s) - handshake ))
+-                    if [ $ago -lt 60 ]; then hs_text="${ago}s ago"
+-                    elif [ $ago -lt 3600 ]; then hs_text="$(( ago / 60 ))m ago"
+-                    else hs_text="$(( ago / 3600 ))h ago"; fi
+-                fi
+-                local rx_h=$(human_size "${rx:-0}")
+-                local tx_h=$(human_size "${tx:-0}")
+-                local item="{\"endpoint\":\"${endpoint}\",\"allowed_ips\":\"${aips}\",\"transfer_rx\":\"${rx_h}\",\"transfer_tx\":\"${tx_h}\",\"latest_handshake\":\"${hs_text}\"}"
+-                [ -n "$p_items" ] && p_items="${p_items},${item}" || p_items="$item"
+-            done <<EOF
+-$dump
+-EOF
+-            peers_json="[${p_items}]"
+-        fi
+-    fi
+-
+-    log_text=$(grep "amneziawg" /tmp/syslog.log 2>/dev/null | tail -20 | sed 's/"/\\"/g' | tr '\n' '|' | sed 's/|/\\n/g')
+-
+-    local default_policy=$(get_setting awg_default_policy)
+-    [ -z "$default_policy" ] && default_policy="direct"
+-    local clients_data=$(get_setting awg_clients | sed 's/"/\\"/g')
+-    local active_rules=$(ip rule show 2>/dev/null | grep -c "lookup $RT_TABLE\|fwmark $FWMARK")
+-
+-    local ipset_count=0
+-    ipset list "$IPSET_NAME" -t 2>/dev/null | grep -q "Number of entries" && \
+-        ipset_count=$(ipset list "$IPSET_NAME" -t 2>/dev/null | awk '/Number of entries/{print $NF}')
+-
+-    local antifilter_active=false
+-    local antifilter_count=0
+-    antifilter_enabled && antifilter_active=true
+-    ipset list MYAWG -t 2>/dev/null | grep -q "Number of entries" && \
+-        antifilter_count=$(ipset list MYAWG -t 2>/dev/null | awk '/Number of entries/{print $NF}')
+-
+-    local geo_domains=0
+-    [ -f "$DNSMASQ_AWG_CONF" ] && geo_domains=$(grep -c "^ipset=" "$DNSMASQ_AWG_CONF" 2>/dev/null)
+-    [ -z "$geo_domains" ] && geo_domains=0
+-
+-    local geo_downloaded=false
+-    geo_available && geo_downloaded=true
+-
+-    local package_version go_version tools_version
+-    package_version=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2; exit}')
+-    [ -z "$package_version" ] && package_version="$AWG_VERSION"
+-    go_version=$(cat /opt/amneziawg/amneziawg-go.version 2>/dev/null)
+-    tools_version=$(cat /opt/amneziawg/amneziawg-tools.version 2>/dev/null)
+-    [ -n "$go_version" ] || go_version=$("$AWG_GO" --version 2>/dev/null | awk 'NR==1{print $2}')
+-    [ -n "$tools_version" ] || tools_version=$("$AWG_BIN" --version 2>/dev/null | awk 'NR==1{print $2}')
+-
+-    cat > "$STATUS_FILE" << STATUSEOF
+-{"running":${running},"version":"${AWG_VERSION}","package_version":"${package_version}","go_version":"${go_version}","tools_version":"${tools_version}","public_key":"${pub_key}","listen_port":"${listen_port}","interface_addr":"${iface_addr}","peers":${peers_json},"default_policy":"${default_policy}","clients":"${clients_data}","active_rules":${active_rules},"ipset_count":${ipset_count},"geo_domains":${geo_domains},"geo_downloaded":${geo_downloaded},"antifilter_enabled":${antifilter_active},"antifilter_count":${antifilter_count},"log":"${log_text}"}
+-STATUSEOF
+-}
+ 
+ # --- Install/Mount/Uninstall ---
+ 
+@@ -1401,10 +1337,12 @@ do_install_page(){
+     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
+ 
+     if is_running; then
+-        repair_aux_routing
++        repair_aux_routing || return 1
+         register_managed_cron
+     fi
+ 
++    ensure_status_loop
++    update_status
+     log_msg "Page installed: $am_webui_page"
+     echo "Installed. Access: VPN > AmneziaWG"
+ }
+@@ -1422,9 +1360,10 @@ do_mount_ui(){
+     fi
+ 
+     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
++    ensure_status_loop
+     update_status
+ 
+-    if [ "$(get_setting awg_autostart)" = "1" ]; then
++    if autostart_enabled; then
+         sleep 10
+         do_start
+     fi
+@@ -1480,6 +1419,7 @@ do_watchdog(){
+         # Even an early startup failure must leave another recovery attempt.
+         cru a awg_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' watchdog"
+         WATCHDOG_RECOVERY=0
++        update_status
+         return "$restart_result"
+     fi
+ 
+@@ -1493,9 +1433,10 @@ do_watchdog(){
+         fi
+     fi
+ 
++    ensure_status_loop
+     # Firmware can reset rp_filter and awg0 recreation removes table 400.
+     save_and_set_rp_filter
+-    ensure_ui_mark_nat
++    ensure_ui_mark_nat || return 1
+     repair_aux_routing
+ }
+ 
+@@ -1529,85 +1470,6 @@ check_update(){
+     echo "{\"current\":\"$current\",\"latest\":\"$latest\",\"update\":$update,\"installed_go\":\"$installed_go\",\"latest_go\":\"$latest_go\",\"installed_tools\":\"$installed_tools\",\"latest_tools\":\"$latest_tools\",\"error\":\"$error\"}"
+ }
+ 
+-do_update(){
+-    log_msg "Updating AmneziaWG..."
+-    local pkg_arch
+-    pkg_arch=$(opkg print-architecture 2>/dev/null | awk '$1=="arch" && $2!="all" {print $2}' | head -1)
+-    if [ -z "$pkg_arch" ]; then
+-        local arch=$(uname -m)
+-        case "$arch" in
+-            aarch64) pkg_arch="aarch64-3.10" ;;
+-            armv7l)  pkg_arch="armv7-2.6" ;;
+-            *) log_msg "ERROR: Unsupported arch: $arch"; return 1 ;;
+-        esac
+-    fi
+-
+-    local release_json
+-    release_json=$(curl -sfL --connect-timeout 10 --max-time 15 "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" 2>/dev/null)
+-    local ipk_url sums_url latest
+-    latest=$(echo "$release_json" | grep '"tag_name"' | head -1 | sed 's/.*"v//;s/".*//')
+-    ipk_url=$(echo "$release_json" | grep '"browser_download_url"' | grep "$pkg_arch" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
+-    if [ -z "$ipk_url" ]; then
+-        local base_arch=$(echo "$pkg_arch" | sed 's/-.*//')
+-        ipk_url=$(echo "$release_json" | grep '"browser_download_url"' | grep "${base_arch}" | grep '.ipk"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
+-    fi
+-    if [ -z "$ipk_url" ]; then
+-        log_msg "ERROR: No package found for $pkg_arch"
+-        return 1
+-    fi
+-    sums_url=$(echo "$release_json" | grep '"browser_download_url"' | grep '/SHA256SUMS"' | head -1 | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
+-    if [ -z "$sums_url" ]; then
+-        log_msg "ERROR: SHA256SUMS not found in release"
+-        return 1
+-    fi
+-
+-    local tmp="/tmp/amneziawg_update.ipk"
+-    local sums="/tmp/amneziawg_SHA256SUMS"
+-    if ! curl -sfL --connect-timeout 10 --max-time 120 "$ipk_url" -o "$tmp"; then
+-        log_msg "ERROR: Download failed"
+-        return 1
+-    fi
+-    if ! curl -sfL --connect-timeout 10 --max-time 30 "$sums_url" -o "$sums"; then
+-        rm -f "$tmp"
+-        log_msg "ERROR: SHA256SUMS download failed"
+-        return 1
+-    fi
+-    local expected actual package_name
+-    package_name=$(basename "$ipk_url")
+-    expected=$(awk -v f="$package_name" '$2==f || $2=="*"f {print $1; exit}' "$sums")
+-    actual=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+-    rm -f "$sums"
+-    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+-        rm -f "$tmp"
+-        log_msg "ERROR: Package SHA256 mismatch"
+-        return 1
+-    fi
+-
+-    local backup_dir="/opt/backup-amneziawg-before-${latest:-update}-$(date +%Y%m%d-%H%M%S)"
+-    mkdir -p "$backup_dir"
+-    cp -a "$SETTINGS" "$backup_dir/" 2>/dev/null || true
+-    cp -a "$CONF" "$AWG_DIR/awg0.addr" "$CLIENTS_FILE" "$backup_dir/" 2>/dev/null || true
+-    log_msg "Backup saved: $backup_dir"
+-
+-    do_stop 2>/dev/null
+-    wait_for_pid_exit amneziawg-go 10
+-    # Block auto-start during opkg install (S99amneziawg is triggered by opkg)
+-    touch /tmp/.awg_no_autostart
+-    if ! /opt/bin/opkg install "$tmp" && ! /opt/bin/opkg install --force-architecture "$tmp"; then
+-        rm -f "$tmp" /tmp/.awg_no_autostart
+-        log_msg "ERROR: Package installation failed"
+-        return 1
+-    fi
+-    rm -f "$tmp"
+-    # Stop VPN if opkg's init script started it
+-    do_stop 2>/dev/null
+-    wait_for_pid_exit amneziawg-go 10
+-    rm -f /tmp/.awg_no_autostart
+-    # Install page from new version
+-    /jffs/addons/amneziawg/amneziawg.sh install_page
+-    log_msg "Update complete. Start VPN from UI."
+-    update_status
+-}
+ 
+ do_wan_event(){
+     local wan_if="$1" wan_state="$2"
+@@ -1628,32 +1490,7 @@ do_wan_event(){
+ do_firewall_restart(){
+     if is_running; then
+         log_msg "Firewall restart detected, re-applying rules"
+-        # Clean base rules first to prevent duplicates
+-        iptables -D INPUT -i "$IFACE" -j ACCEPT 2>/dev/null
+-        iptables -D FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null
+-        iptables -D FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null
+-        iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+-        iptables -t mangle -D FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+-        local lan_net_old
+-        lan_net_old=$(get_lan_net)
+-        [ -n "$lan_net_old" ] && iptables -t nat -D POSTROUTING -s "$lan_net_old" -o "$IFACE" -j MASQUERADE 2>/dev/null
+-        iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null
+-        cleanup_ipv6_block
+-        iptables -I INPUT -i "$IFACE" -j ACCEPT
+-        iptables -I FORWARD -i "$IFACE" -j ACCEPT
+-        iptables -I FORWARD -o "$IFACE" -j ACCEPT
+-        iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-        iptables -t mangle -A FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-        local lan_net
+-        lan_net=$(get_lan_net)
+-        if [ -n "$lan_net" ]; then
+-            iptables -t nat -I POSTROUTING -s "$lan_net" -o "$IFACE" -j MASQUERADE
+-        else
+-            iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE
+-        fi
+-        setup_ipv6_block
+-        setup_firewall
+-        ensure_main_routes
++        setup_firewall || return 1
+     fi
+ }
+ 
+@@ -1665,13 +1502,15 @@ do_service_event(){
+         awgstart)       do_start ;;
+         awgstop)        do_stop ;;
+         awgrestart)     do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
+-        awgsaveconf)
++        awgsaveconf|awgsaveupdategeo)
+             local _wt=0; while [ $_wt -lt 5 ] && [ -z "$(get_setting awg_privatekey)" ]; do sleep 1; _wt=$((_wt+1)); done
+             local old_config new_config
+             old_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
++            validate_runtime_settings || return 1
+             generate_config || return 1
+             new_config=$(cat "$CONF" "$AWG_DIR/awg0.addr" 2>/dev/null)
+-            update_geo_if_needed
++            if [ "$event" = awgsaveupdategeo ]; then update_geo_lists || return 1;
++            else update_geo_if_needed || return 1; fi
+             if is_running && [ "$old_config" != "$new_config" ]; then
+                 log_msg "Tunnel settings changed; restarting"
+                 do_stop
+@@ -1679,26 +1518,26 @@ do_service_event(){
+                 return $?
+             fi
+             if is_running; then
+-                setup_firewall
++                setup_firewall || return 1
+             elif ! antifilter_enabled; then
+                 disable_aux_routing
+             fi
+             update_status
+             ;;
+         awgupdategeo)
+-            update_geo_lists
+-            is_running && setup_firewall
++            update_geo_lists || return 1
++            if is_running; then setup_firewall || return 1; fi
+             update_status
+             ;;
+         awgupdateantifilter)
+-            update_antifilter
++            update_antifilter || return 1
+             update_status
+             ;;
+         awgcheckupdate)
+             check_update > /www/user/awg_update.htm
+             ;;
+         awgdoupdate)
+-            do_update
++            do_update || return 1
+             update_status
+             ;;
+     esac
+@@ -1715,16 +1554,33 @@ tunnel_healthy(){
+     return 1
+ }
+ 
++. "${AWG_RUNTIME_PATH:-$ADDON_DIR/awg-runtime.sh}" || exit 1
++
+ # --- Main ---
+ 
+ # Serialize runtime changes. Package upgrades manage stop/install separately
+ # because opkg invokes this script again from its installation hooks.
+ operation="$1"
+-[ "$1" = "service_event" ] && operation="$3"
++if [ "$1" = "service_event" ]; then
++    operation=${3%%_*}
++    operation_id=${3#*_}
++    case "$operation_id" in ''|*[!0-9]*) operation_id=0;; esac
++    [ "$operation_id" = 0 ] || operation_write "$operation_id" running "$operation"
++fi
+ case "$operation" in
+-    status|check_update|awgcheckupdate|update|awgdoupdate) ;;
++    status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
+     *)
+-        acquire_lock || exit 1
++        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
++            log_msg 'ERROR: package update in progress'
++            [ -z "${operation_id:-}" ] || operation_write "$operation_id" failed 'Package update in progress'
++            exit 1
++        fi
++        acquire_lock || { [ -n "${operation_id:-}" ] && operation_write "$operation_id" failed "Busy; retry after the current operation"; exit 1; }
++        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
++            release_lock
++            [ -z "${operation_id:-}" ] || operation_write "$operation_id" failed 'Package update in progress'
++            exit 1
++        fi
+         DISPATCH_LOCK=1
+         trap 'rm -rf "$LOCKDIR"' 0
+         trap 'exit 1' 1 2 15
+@@ -1733,10 +1589,13 @@ esac
+ 
+ case "$1" in
+     start)          do_start ;;
++    boot_start)     if autostart_enabled; then do_start; fi ;;
++    status_loop)    status_loop ;;
++    prefill_worker) prefill_worker ;;
+     stop)           do_stop ;;
+     restart)        do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
+     status)         update_status ;;
+-    update_geo)     update_geo_lists; is_running && setup_firewall; update_status ;;
++    update_geo)     update_geo_lists && { if is_running; then setup_firewall; fi; } && update_status ;;
+     update_ipset)   update_antifilter ;;
+     check_update)   check_update ;;
+     update)         do_update ;;
+@@ -1744,9 +1603,16 @@ case "$1" in
+     install_page)   do_install_page ;;
+     mount_ui)       do_mount_ui ;;
+     uninstall)      do_uninstall ;;
+-    service_event)  do_service_event "$2" "$3" ;;
++    service_event)  do_service_event "$2" "$operation" ;;
+     wan_event)      do_wan_event "$2" "$3" ;;
+     firewall_restart) do_firewall_restart ;;
+     download_geo)   download_all_geo ;;
+     *)              echo "Usage: $0 {start|stop|restart|status|update_geo|update_ipset|download_geo|install_page|uninstall}" ;;
+ esac
++
++operation_result=$?
++if [ -n "${operation_id:-}" ] && [ "$operation_id" != 0 ]; then
++    if [ "$operation_result" = 0 ]; then operation_write "$operation_id" succeeded "$operation";
++    else operation_write "$operation_id" failed "Operation failed; see log"; fi
++fi
++exit "$operation_result"
+diff --git a/addon/amneziawg_page.asp b/addon/amneziawg_page.asp
+index 4cde257..761c0f5 100644
+--- a/addon/amneziawg_page.asp
++++ b/addon/amneziawg_page.asp
+@@ -102,6 +102,7 @@ var v2flyList = [];
+ var v2flyIpList = ['telegram','google','facebook','twitter','netflix','cloudflare','fastly','cloudfront'];
+ var antifilterRuntimeEnabled = true;
+ var awgRuntimeRunning = false;
++var antifilterRuntimeActive = false;
+ function escHtml(s){
+     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+ }
+@@ -131,14 +132,60 @@ function checkForUpdate(){
+     loadUpdateResult(false);
+ }
+ 
+-function requestUpdateCheck(){
+-    var btn = document.getElementById('btn_check_updates');
+-    var status = document.getElementById('awg_update_status');
+-    if(btn){ btn.disabled = true; btn.value = 'Checking...'; }
+-    if(status) status.textContent = 'Contacting GitHub...';
+-    document.form.action_script.value = "start_awgcheckupdate";
++var activeOperation = false;
++function submitOperation(action, done){
++    if(activeOperation) return;
++    var id = String(Date.now());
++    activeOperation = true;
++    var box = document.getElementById('awg_operation');
++    box.textContent = 'Operation in progress...';
++    var started = Date.now();
++    document.form.action_script.value = action + '_' + id;
+     document.form.submit();
+-    setTimeout(function(){ loadUpdateResult(true); }, 4000);
++    function poll(){
++        if(Date.now() - started > 600000){
++            activeOperation = false;
++            box.textContent = 'No completion receipt. Check LOG before retrying.';
++            return;
++        }
++        var xhr = new XMLHttpRequest();
++        xhr.open('GET', '/user/awg_operation_' + id + '.htm?_=' + Date.now(), true);
++        xhr.timeout = 5000;
++        var finished = false;
++        xhr.onload = function(){
++            try {
++                var result = JSON.parse(xhr.responseText);
++                if(result.id === id && (result.state === 'succeeded' || result.state === 'failed')){
++                    finished = true; activeOperation = false;
++                    box.textContent = result.state === 'succeeded' ? 'Completed' : result.message;
++                    refreshStatus();
++                    if(result.state === 'succeeded' && done) done();
++                }
++            } catch(e){}
++        };
++        xhr.onloadend = function(){ if(!finished) setTimeout(poll, 1500); };
++        xhr.send();
++    }
++    setTimeout(poll, 1000);
++}
++function validIPv4(value){
++    var parts = value.split('.');
++    return parts.length === 4 && parts.every(function(x){return /^[0-9]{1,3}$/.test(x) && Number(x) <= 255;});
++}
++function validateClientRows(){
++    var seen = {};
++    var rows = document.querySelectorAll('#awg_client_rows tr');
++    for(var i=0;i<rows.length;i++){
++        var ip=rows[i].querySelector('.client_ip').value.trim();
++        if(!ip) continue;
++        if(!validIPv4(ip) || seen[ip]){alert('Invalid or duplicate device IPv4: ' + ip);return false;}
++        seen[ip]=true;
++    }
++    return true;
++}
++
++function requestUpdateCheck(){
++    submitOperation('start_awgcheckupdate', function(){loadUpdateResult(true);});
+ }
+ 
+ function loadUpdateResult(showErrors){
+@@ -197,44 +244,13 @@ function showVersionInfo(data){
+ }
+ 
+ function doUpdate(){
+-    if(!confirm('Update AmneziaWG?\nVPN will be stopped. After update click Start.')) return;
+-    var badge = document.getElementById('awg_badge');
+-    badge.className = 'awg-status connecting';
+-    badge.innerHTML = '&#9679; Updating...';
+-    if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
+-
+-    document.form.action_script.value = "start_awgdoupdate";
+-    document.form.submit();
+-
+-    // Wait for update to finish (VPN stopped, new version installed), then reload
+-    var attempts = 0;
+-    setTimeout(function(){
+-        var poll = setInterval(function(){
+-            attempts++;
+-            var xhr = new XMLHttpRequest();
+-            xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
+-            xhr.timeout = 3000;
+-            xhr.onload = function(){
+-                try {
+-                    var s = JSON.parse(xhr.responseText);
+-                    // Update done when VPN is stopped (do_update stops it)
+-                    if(!s.running || attempts >= 120){
+-                        clearInterval(poll);
+-                        location.reload();
+-                    }
+-                } catch(e){
+-                    if(attempts >= 120){ clearInterval(poll); location.reload(); }
+-                }
+-            };
+-            xhr.onerror = function(){ if(attempts >= 120){ clearInterval(poll); location.reload(); } };
+-            xhr.send();
+-        }, 2000);
+-    }, 5000);
++    if(confirm('Install the latest package? VPN will stop; click Start after completion.'))
++        submitOperation('start_awgdoupdate', function(){location.reload();});
+ }
+ 
+ function loadSettings(){
+     var fields = [
+-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns',
++        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
+         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
+         'awg_peer_allowedips', 'awg_peer_keepalive',
+         'awg_jc', 'awg_jmin', 'awg_jmax',
+@@ -269,6 +285,7 @@ function loadSettings(){
+             }
+         } catch(e){}
+     }
++    document.getElementById('awg_autostart').checked = custom_settings.awg_autostart !== '0';
+     // Load default policy
+     var defPolicy = document.getElementById('default_policy');
+     defPolicy.value = custom_settings.awg_default_policy || 'direct';
+@@ -280,9 +297,10 @@ function loadSettings(){
+     updateGeoVisibility();
+ }
+ 
+-function saveSettings(){
++function saveSettings(action){
++    if(activeOperation || !validateClientRows()) return;
+     var fields = [
+-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns',
++        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
+         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
+         'awg_peer_allowedips', 'awg_peer_keepalive',
+         'awg_jc', 'awg_jmin', 'awg_jmax',
+@@ -304,6 +322,7 @@ function saveSettings(){
+             custom_settings[fields[i]] = v;
+         }
+     }
++    custom_settings.awg_autostart = document.getElementById('awg_autostart').checked ? '1' : '0';
+     // Save default policy and clients
+     custom_settings.awg_default_policy = document.getElementById('default_policy').value;
+     custom_settings.awg_clients = serializeClients();
+@@ -336,15 +355,13 @@ function saveSettings(){
+         alert('Invalid key format. Keys must be 44 characters (base64).');
+         return;
+     }
+-    if(ep.indexOf(':') === -1){
++    if(!/^[a-zA-Z0-9.-]+:[0-9]+$/.test(ep) || Number(ep.split(':')[1]) < 1 || Number(ep.split(':')[1]) > 65535){
+         alert('Endpoint must include port (e.g. server:51820).');
+         return;
+     }
+ 
+     document.getElementById('amng_custom').value = JSON.stringify(custom_settings);
+-    document.form.action_script.value = "start_awgsaveconf";
+-    document.form.submit();
+-    setTimeout(function(){ location.reload(); }, 15000);
++    submitOperation(action || 'start_awgsaveconf');
+ }
+ 
+ // === Routing: per-device with individual policies ===
+@@ -358,14 +375,15 @@ function loadClients(){
+     for(var i = 0; i < entries.length; i++){
+         if(!entries[i]) continue;
+         var parts = entries[i].split(',');
+-        addClientRow(parts[0] || '', parts[1] || '', parts[2] || 'vpn_all');
++        addClientRow(parts[0] || '', parts[1] || '', parts[2] || 'vpn_all', parts[3] || '');
+     }
+     updateGeoVisibility();
+ }
+ 
+-function addClientRow(ip, name, policy){
++function addClientRow(ip, name, policy, mac){
+     var tbody = document.getElementById('awg_client_rows');
+     var tr = document.createElement('tr');
++    tr.setAttribute('data-mac', mac || '');
+     policy = policy || 'vpn_all';
+     tr.innerHTML =
+         '<td><input type="text" class="client_ip input_25_table" value="' + escHtml(ip) + '" placeholder="192.168.1.100"></td>' +
+@@ -387,7 +405,7 @@ function serializeClients(){
+         var ip = rows[i].querySelector('.client_ip').value.trim();
+         var name = rows[i].querySelector('.client_name').value.trim();
+         var policy = rows[i].querySelector('.client_policy').value;
+-        if(ip) parts.push(ip + ',' + name.replace(/[,;]/g, ' ') + ',' + policy);
++        if(ip) parts.push(ip + ',' + name.replace(/[,;]/g, ' ') + ',' + policy + ',' + (rows[i].getAttribute('data-mac') || ''));
+     }
+     return parts.join(';');
+ }
+@@ -452,6 +470,9 @@ function updateAntiFilterControls(count){
+         } else if(!awgRuntimeRunning){
+             status.textContent = 'Enabled; start AmneziaWG to update';
+             status.style.color = '#aaa';
++        } else if(!antifilterRuntimeActive){
++            status.textContent = 'Enabled in settings; routing not ready';
++            status.style.color = '#fc0';
+         } else {
+             status.textContent = 'Enabled' + (count > 0 ? ' — ' + count + ' IP ranges' : '');
+             status.style.color = '#9f9';
+@@ -473,9 +494,7 @@ function updateAntiFilter(){
+     var status = document.getElementById('antifilter_status');
+     if(btn) btn.disabled = true;
+     if(status){ status.textContent = 'Updating AntiFilter...'; status.style.color = '#fc0'; }
+-    document.form.action_script.value = "start_awgupdateantifilter";
+-    document.form.submit();
+-    setTimeout(function(){ location.reload(); }, 60000);
++    submitOperation('start_awgupdateantifilter');
+ }
+ 
+ function getCheckedValues(prefix){
+@@ -494,17 +513,7 @@ function setCheckedValues(prefix, csv){
+ }
+ 
+ function updateGeoLists(){
+-    var btn = document.getElementById('btn_geo_update');
+-    var isDownload = btn && btn.value === 'Download Lists';
+-    var msg = isDownload
+-        ? 'Download all GeoIP and domain lists?\nThis may take 1-2 minutes.'
+-        : 'Force re-download all GeoIP and domain lists?\nThis may take 1-2 minutes.';
+-    if(!confirm(msg)) return;
+-    var log = document.getElementById('awg_log');
+-    if(log) log.textContent = 'Downloading geo lists... Please wait.';
+-    document.form.action_script.value = "start_awgupdategeo";
+-    document.form.submit();
+-    setTimeout(function(){ location.reload(); }, 60000);
++    if(confirm('Save current settings and download the selected Geo lists?')) saveSettings('start_awgsaveupdategeo');
+ }
+ 
+ function fetchDhcpClients(){
+@@ -604,50 +613,7 @@ function addManualIPs(input){
+ }
+ 
+ function awgAction(action){
+-    document.form.action_script.value = action;
+-    document.form.submit();
+-    var badge = document.getElementById('awg_badge');
+-    var isStop = action.indexOf('stop') !== -1;
+-    var expect = !isStop;
+-
+-    // Stop periodic refresh while action runs
+-    if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
+-    document.getElementById('btn_start').disabled = true;
+-    document.getElementById('btn_stop').disabled = true;
+-    document.getElementById('btn_restart').disabled = true;
+-
+-    // Show transitional status
+-    badge.className = 'awg-status connecting';
+-    badge.innerHTML = isStop ? '&#9679; Stopping...' : '&#9679; Connecting...';
+-
+-    // Poll until status is fully ready
+-    var attempts = 0;
+-    var poll = setInterval(function(){
+-        attempts++;
+-        var xhr = new XMLHttpRequest();
+-        xhr.open('GET', '/user/awg_status.htm?_=' + Date.now(), true);
+-        xhr.timeout = 3000;
+-        xhr.onload = function(){
+-            try {
+-                var s = JSON.parse(xhr.responseText);
+-                // For start: wait until running AND has public key (fully ready)
+-                // For stop: wait until not running
+-                var ready = (s.running === expect);
+-                if(ready || attempts >= 90){
+-                    clearInterval(poll);
+-                    updateStatusUI(s);
+-                    statusTimer = setInterval(refreshStatus, 5000);
+-                    document.getElementById('btn_start').disabled = false;
+-                    document.getElementById('btn_stop').disabled = false;
+-                    document.getElementById('btn_restart').disabled = false;
+-                }
+-            } catch(e){
+-                if(attempts >= 90){ clearInterval(poll); refreshStatus(); document.getElementById('btn_start').disabled = false; document.getElementById('btn_stop').disabled = false; document.getElementById('btn_restart').disabled = false; }
+-            }
+-        };
+-        xhr.onerror = function(){ if(attempts >= 90){ clearInterval(poll); refreshStatus(); document.getElementById('btn_start').disabled = false; document.getElementById('btn_stop').disabled = false; document.getElementById('btn_restart').disabled = false; } };
+-        xhr.send();
+-    }, 2000);
++    submitOperation(action);
+ }
+ 
+ function showLoading(){}
+@@ -675,6 +641,7 @@ function refreshStatus(){
+ }
+ 
+ function updateStatusUI(s){
++    if(!s.measured_at || Date.now()/1000 - s.measured_at > 30){setOfflineUI();return;}
+     var badge = document.getElementById('awg_badge');
+     var info = document.getElementById('awg_info');
+     var peers = document.getElementById('awg_peers');
+@@ -691,7 +658,8 @@ function updateStatusUI(s){
+ 
+     if(s.running){
+         badge.className = 'awg-status running';
+-        badge.innerHTML = '&#9679; Connected';
++        badge.textContent = s.state === 'handshake_recent' ? 'Recent handshake' : 'Interface up; waiting for handshake';
++        if(s.state !== 'handshake_recent') badge.className = 'awg-status connecting';
+         document.getElementById('btn_start').style.display = 'none';
+         document.getElementById('btn_stop').style.display = '';
+         document.getElementById('btn_restart').style.display = '';
+@@ -706,8 +674,9 @@ function updateStatusUI(s){
+     if(s.antifilter_enabled !== undefined){
+         antifilterRuntimeEnabled = !!s.antifilter_enabled;
+     }
++    antifilterRuntimeActive = !!s.antifilter_active;
+     updateAntiFilterControls(parseInt(s.antifilter_count || 0, 10));
+-    antiFilterSettingChanged();
++    if(document.getElementById('antifilter_enabled').checked !== antifilterRuntimeEnabled) antiFilterSettingChanged();
+ 
+     info.innerHTML = '';
+     if(s.interface_addr) info.innerHTML += 'Address: ' + escHtml(s.interface_addr) + '<br>';
+@@ -729,6 +698,7 @@ function updateStatusUI(s){
+     peers.innerHTML = html;
+ 
+     if(s.log) logbox.textContent = s.log;
++    if(s.geo_warnings > 0) info.innerHTML += '<br>GeoSite conversion warnings: ' + Number(s.geo_warnings) + ' (see LOG).';
+ 
+     // Route info
+     var rulesEl = document.getElementById('awg_active_rules');
+@@ -758,7 +728,7 @@ function updateStatusUI(s){
+ function setOfflineUI(){
+     var badge = document.getElementById('awg_badge');
+     badge.className = 'awg-status stopped';
+-    badge.innerHTML = '&#9679; Stopped';
++    badge.innerHTML = 'Status unavailable / stale';
+     document.getElementById('btn_start').style.display = '';
+     document.getElementById('btn_stop').style.display = 'none';
+     document.getElementById('btn_restart').style.display = 'none';
+@@ -983,6 +953,7 @@ function initAutocompleteIp(){
+ <div id="Loading" class="popup_bg"></div>
+ <iframe name="hidden_frame" id="hidden_frame" src="about:blank" width="0" height="0" frameborder="0"></iframe>
+ 
++<div id="awg_operation" role="status" style="padding:10px;color:#fc0;"></div>
+ <form method="post" name="form" id="ruleForm" action="/start_apply.htm" target="hidden_frame">
+ <input type="hidden" name="productid" value="<% nvram_get("productid"); %>">
+ <input type="hidden" name="current_page" value="">
+@@ -1088,9 +1059,10 @@ function initAutocompleteIp(){
+                     <td><input type="text" class="input_6_table" id="awg_listenport" maxlength="5" placeholder="51820"></td>
+                 </tr>
+                 <tr>
+-                    <th>DNS</th>
+-                    <td><input type="text" class="input_20_table" id="awg_dns" maxlength="64" placeholder="1.1.1.1"></td>
++                    <th>DNS for selected domains (IPv4)</th>
++                    <td><input type="text" class="input_20_table" id="awg_dns" maxlength="64" placeholder="Blank: router DNS"></td>
+                 </tr>
++<tr><th>Router startup</th><td><label><input type="checkbox" id="awg_autostart"> Start AmneziaWG after reboot</label></td></tr>
+                 </table>
+ 
+                 <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable" style="margin-top:8px;">
+@@ -1267,6 +1239,7 @@ function initAutocompleteIp(){
+                         <span style="color:#888; font-size:11px; margin-left:8px;">Uses MYAWG, mark 0x66 and table 400. Enabled by default.</span>
+                     </td>
+                 </tr>
++<tr><th>Incoming VPN source networks</th><td><input type="text" class="input_32_table" id="awg_vpn_source_nets" placeholder="10.8.0.0/24,10.10.10.0/24"><br>IPv4 CIDRs, comma-separated. Blank uses the defaults shown.</td></tr>
+                 <tr>
+                     <th>List Update</th>
+                     <td>
+@@ -1278,6 +1251,7 @@ function initAutocompleteIp(){
+ 
+                 <!-- ==================== GEO ROUTING ==================== -->
+                 <div id="geo_section" style="display:none;">
++<p style="color:#fc0">IPv4 routing only. Native WAN IPv6 is not routed by this addon. Use router DNS on LAN and incoming VPN clients; encrypted DNS can bypass domain selection. GeoSite domain/full entries use DNS suffix matching; keyword/regexp entries are reported and skipped. Existing connections may need reconnecting after policy changes.</p>
+ 
+                 <div style="border:1px solid #fc0; border-radius:4px; padding:10px 14px; margin-top:10px; font-size:12px; color:#fc0;">
+                     <b>Важно:</b> Для работы VPN Geo устройства должны использовать роутер как DNS-сервер.<br>
+diff --git a/addon/awg-common.sh b/addon/awg-common.sh
+new file mode 100644
+index 0000000..a309a65
+--- /dev/null
++++ b/addon/awg-common.sh
+@@ -0,0 +1,41 @@
++#!/bin/sh
++# Shared, side-effect-free helpers. BusyBox ash compatible.
++json_string(){
++    LC_ALL=C awk 'BEGIN{printf "\""} {if(NR>1)printf "\\n"; for(i=1;i<=length($0);i++){c=substr($0,i,1); if(c=="\\")printf "\\\\"; else if(c=="\"")printf "\\\""; else if(c=="\t")printf "\\t"; else if(c=="\r")printf "\\r"; else if(c ~ /[[:cntrl:]]/)printf "?"; else printf "%s",c}} END{printf "\""}'
++}
++valid_ipv4(){
++    printf '%s\n' "$1" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++)if($i!~/^[0-9]+$/ || length($i)>3 || $i+0>255)exit 1}'
++}
++# Validate all records before producing a canonical set. Optional IPv6 exclusion
++# is explicit; unknown input is an error, never silently a partial IPv4 list.
++normalize_cidrs(){
++    awk -v skip6="${3:-0}" '
++    {gsub(/\r/,""); sub(/#.*/,""); gsub(/^[ \t]+|[ \t]+$/,""); if($0=="")next
++     if(index($0,":")){if(skip6==1 && $0 ~ /^[0-9a-fA-F:.\/]+$/)next; bad=1;next}
++     n=split($0,p,"/"); if(n>2 || (n==2 && (p[2]!~/^[0-9]+$/ || p[2]+0>32))){bad=1;next}
++     if(split(p[1],o,".")!=4){bad=1;next}
++     ok=1;for(i=1;i<=4;i++)if(o[i]!~/^[0-9]+$/ || length(o[i])>3 || o[i]+0>255)ok=0
++     if(!ok){bad=1;next}
++     bits=(n==1?32:p[2]+0); out=""
++     for(i=1;i<=4;i++){b=bits>=8?8:bits; if(b<0)b=0; unit=2^(8-b); v=int((o[i]+0)/unit)*unit; out=out (i==1?"":".") v; bits-=8}
++     print out "/" (n==1?32:p[2]+0); count++
++    } END{if(bad || !count)exit 1}' "$1" > "$2.raw" || { rm -f "$2.raw"; return 1; }
++    LC_ALL=C sort -u "$2.raw" > "$2" || return 1
++    rm -f "$2.raw"
++}
++valid_domain(){
++    [ -n "$1" ] && [ ${#1} -le 253 ] || return 1
++    printf '%s\n' "$1" | awk -F. '{for(i=1;i<=NF;i++)if(length($i)<1 || length($i)>63 || $i!~/^[a-zA-Z0-9_-]+$/ || $i~/^-/ || $i~/-$/)exit 1}'
++}
++# Kernel canonical output permits exact cache/runtime comparison (no count floor).
++set_members(){
++    local snapshot
++    snapshot=$(mktemp /tmp/awg_set.XXXXXX) || return 1
++    ipset save "$1" > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
++    awk '$1=="add"{v=$3;if(index(v,"/")==0)v=v"/32";print v}' "$snapshot" | LC_ALL=C sort -u
++    rm -f "$snapshot"
++}
++
++valid_geosite_name(){
++    printf '%s\n' "$1" | grep -qE '^[a-z0-9][a-z0-9._-]*(@[a-z0-9][a-z0-9._-]*)?$'
++}
+diff --git a/addon/awg-ipset-update.sh b/addon/awg-ipset-update.sh
+index a9b89b1..381dcb0 100644
+--- a/addon/awg-ipset-update.sh
++++ b/addon/awg-ipset-update.sh
+@@ -3,6 +3,8 @@
+ # Keeps MYAWG/mark 0x66/table 400 separate from the web UI's
+ # awg_dst/mark 0x100/table 300.
+ 
++. "${AWG_COMMON_PATH:-/jffs/addons/amneziawg/awg-common.sh}" || exit 1
++
+ URL="https://antifilter.download/list/allyouneed.lst"
+ 
+ SET="MYAWG"
+@@ -15,7 +17,8 @@ MARK="0x66"
+ PRIO="10"
+ 
+ # Incoming VPN clients that may override an existing firmware/service mark.
+-VPN_SRC_NETS="10.8.0.0/24 10.10.10.0/24"
++VPN_SRC_NETS=$(awk '$1=="awg_vpn_source_nets" {sub(/^[^ ]+ /,"");gsub(/,/," ");print;exit}' /jffs/addons/custom_settings.txt 2>/dev/null)
++[ -n "$VPN_SRC_NETS" ] || VPN_SRC_NETS="10.8.0.0/24 10.10.10.0/24"
+ 
+ BASE="/jffs/addons/awg-ipset"
+ TMP="/tmp/allyouneed.lst"
+@@ -54,7 +57,7 @@ add_rule_once(){
+     chain="$2"
+     shift 2
+     iptables -t "$table" -C "$chain" "$@" 2>/dev/null || \
+-        iptables -t "$table" -A "$chain" "$@"
++        iptables -t "$table" -A "$chain" "$@" || { ROUTING_FAILED=1; return 1; }
+ }
+ 
+ delete_rule_all(){
+@@ -93,9 +96,9 @@ routing_is_active(){
+ attach_chain_after_awg(){
+     base_chain="$1"
+ 
+-    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers 2>/dev/null | \
++    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | \
+         awk '$2=="AWG" {n=$1} END {print n}')
+-    myawg_line=$(iptables -t mangle -L "$base_chain" --line-numbers 2>/dev/null | \
++    myawg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | \
+         awk -v chain="$CHAIN" '$2==chain {n=$1} END {print n}')
+ 
+     if [ -n "$awg_line" ] && [ "$myawg_line" = "$((awg_line + 1))" ]; then
+@@ -108,6 +111,7 @@ attach_chain_after_awg(){
+     # Firmware/addon firewall rebuilds can change ordering, so reposition only
+     # when needed. The UI-managed AWG chain must remain immediately before us.
+     delete_rule_all mangle "$base_chain" -j "$CHAIN"
++    awg_line=$(iptables -t mangle -L "$base_chain" --line-numbers -n 2>/dev/null | awk '$2=="AWG" {n=$1} END {print n}')
+     if [ -n "$awg_line" ]; then
+         iptables -t mangle -I "$base_chain" $((awg_line + 1)) -j "$CHAIN"
+     else
+@@ -116,51 +120,62 @@ attach_chain_after_awg(){
+ }
+ 
+ ensure_routing(){
++    ROUTING_FAILED=0
+     antifilter_allowed || { disable_routing; return 1; }
+     ip link show "$IFACE" >/dev/null 2>&1 || {
+         log "ERROR: interface $IFACE not found"
+         return 1
+     }
+ 
+-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
++    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
+ 
+     if ! ip rule show 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE"; then
+-        ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO"
++        ip rule add fwmark "$MARK" table "$TABLE" priority "$PRIO" || return 1
+     fi
+-    ip route replace default dev "$IFACE" table "$TABLE"
++    ip route replace default dev "$IFACE" table "$TABLE" || return 1
+     ip route flush cache 2>/dev/null
+ 
+-    iptables -t mangle -N "$CHAIN" 2>/dev/null
+-    # Explicit Direct devices must bypass AntiFilter, including VPN clients.
+-    if ! iptables -t mangle -C "$CHAIN" -m mark --mark 0x101/0xffffffff -j RETURN 2>/dev/null; then
+-        iptables -t mangle -I "$CHAIN" 1 -m mark --mark 0x101/0xffffffff -j RETURN
+-    fi
+-
++    # Replace the complete chain in one mangle-table commit. An invalid rule
++    # cannot leave half a chain active. Equal contents do not reset counters.
+     lan_net=$(get_lan_net)
+     endpoint_ip=$(get_endpoint_ip 2>/dev/null)
++    desired_file="$RESTORE.chain"
++    {
++        echo "-A $CHAIN -m mark --mark 0x101/0xffffffff -j RETURN"
++        echo "-A $CHAIN -m addrtype --dst-type LOCAL -j RETURN"
++        [ -z "$lan_net" ] || echo "-A $CHAIN -d $lan_net -j RETURN"
++        echo "-A $CHAIN -p udp -m multiport --dports 67,68,123 -j RETURN"
++        echo "-A $CHAIN -d 224.0.0.0/4 -j RETURN"
++        [ -z "$endpoint_ip" ] || echo "-A $CHAIN -d $endpoint_ip/32 -j RETURN"
++        for vpn_net in $VPN_SRC_NETS; do
++            # Do not allow setting contents to become iptables-restore syntax.
++            case "$vpn_net" in *[!0-9./]*|'') log 'ERROR: invalid VPN source network'; return 1;; esac
++            echo "-A $CHAIN -s $vpn_net -m set --match-set $SET dst -j MARK --set-mark $MARK"
++        done
++        echo "-A $CHAIN -m mark --mark 0x100/0xffffffff -j RETURN"
++        echo "-A $CHAIN -m mark ! --mark 0x0/0xffffffff -j RETURN"
++        echo "-A $CHAIN -m set --match-set $SET dst -j MARK --set-mark $MARK"
++    } > "$desired_file" || return 1
++    actual=$(iptables -t mangle -S "$CHAIN" 2>/dev/null)
++    if ! cmp -s "$desired_file" /tmp/.myawg_chain_desired || [ "$actual" != "$(cat /tmp/.myawg_chain_rules 2>/dev/null)" ]; then
++        {
++            echo '*mangle'
++            echo ":$CHAIN - [0:0]"
++            echo "-F $CHAIN"
++            cat "$desired_file"
++            echo COMMIT
++        } > "$RESTORE.chain-restore"
++        iptables-restore --noflush < "$RESTORE.chain-restore" || return 1
++    fi
+ 
+-    add_rule_once mangle "$CHAIN" -m addrtype --dst-type LOCAL -j RETURN
+-    [ -n "$lan_net" ] && add_rule_once mangle "$CHAIN" -d "$lan_net" -j RETURN
+-    add_rule_once mangle "$CHAIN" -p udp -m multiport --dports 67,68,123 -j RETURN
+-    add_rule_once mangle "$CHAIN" -d 224.0.0.0/4 -j RETURN
+-    [ -n "$endpoint_ip" ] && add_rule_once mangle "$CHAIN" -d "$endpoint_ip"/32 -j RETURN
+-
+-    # These source-specific rules intentionally precede the mark guards.
+-    for vpn_net in $VPN_SRC_NETS; do
+-        add_rule_once mangle "$CHAIN" -s "$vpn_net" \
+-            -m set --match-set "$SET" dst -j MARK --set-mark "$MARK"
+-    done
+-
+-    # Preserve the UI-managed mark and all other non-zero service marks.
+-    add_rule_once mangle "$CHAIN" -m mark --mark 0x100/0xffffffff -j RETURN
+-    add_rule_once mangle "$CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN
+-    add_rule_once mangle "$CHAIN" -m set --match-set "$SET" dst -j MARK --set-mark "$MARK"
+-
+-    attach_chain_after_awg PREROUTING
+-    attach_chain_after_awg OUTPUT
++    attach_chain_after_awg PREROUTING || return 1
++    attach_chain_after_awg OUTPUT || return 1
+ 
+     add_rule_once nat POSTROUTING \
+         -m mark --mark "$MARK"/0xffffffff -o "$IFACE" -j MASQUERADE
++    [ "$ROUTING_FAILED" = 0 ] && routing_is_active || return 1
++    iptables -t mangle -S "$CHAIN" > /tmp/.myawg_chain_rules || return 1
++    cp "$desired_file" /tmp/.myawg_chain_desired
+ }
+ 
+ disable_routing(){
+@@ -184,7 +199,9 @@ disable_routing(){
+     ip route flush cache 2>/dev/null
+     ipset destroy "$TMP_SET" 2>/dev/null
+     ipset destroy "$SET" 2>/dev/null
+-    [ "$was_active" = true ] && log "AntiFilter disabled"
++    rm -f /tmp/.myawg_chain_rules /tmp/.myawg_chain_desired
++    [ "$was_active" != true ] || log "AntiFilter disabled"
++    return 0
+ }
+ 
+ full_rebuild_from_new_list(){
+@@ -203,32 +220,41 @@ full_rebuild_from_new_list(){
+         ipset destroy "$TMP_SET" 2>/dev/null
+         return 1
+     fi
++    # Prepare durable cache before touching the live set. Keep the old cache
++    # until swap is known to have succeeded; every next update reconciles members.
++    cp "$NEW_LIST" "$OLD_LIST.tmp" || return 1
+     if ! ipset swap "$TMP_SET" "$SET"; then
++        rm -f "$OLD_LIST.tmp"
+         log "ERROR: ipset swap failed; cache unchanged"
+         return 1
+     fi
+-    ipset destroy "$TMP_SET" 2>/dev/null
+-    if ! cp "$NEW_LIST" "$OLD_LIST.tmp" || ! mv "$OLD_LIST.tmp" "$OLD_LIST"; then
+-        log "ERROR: cannot commit AntiFilter cache"
++    if ! mv "$OLD_LIST.tmp" "$OLD_LIST"; then
++        ipset swap "$TMP_SET" "$SET" || log "ERROR: rollback swap failed"
++        log "ERROR: cannot commit cache; rolled back live set"
+         return 1
+     fi
++    ipset destroy "$TMP_SET" 2>/dev/null
+     log "Full rebuild done"
+ }
+ 
+ restore_from_cache_if_needed(){
+-    count=$(ipset_count)
+-    [ -n "$count" ] || count=0
+-    [ "$count" -ge "$MIN_NETS" ] 2>/dev/null && return 0
+-    [ -s "$OLD_LIST" ] || { log "ipset empty and no cached list"; return 1; }
+-    log "Restoring depleted ipset from cache (entries: $count)"
+-    cp "$OLD_LIST" "$NEW_LIST"
++    [ -s "$OLD_LIST" ] || { log "No cached list"; return 1; }
++    normalize_cidrs "$OLD_LIST" "$RESTORE.checked" || { log "ERROR: invalid cached list"; return 1; }
++    set_members "$SET" > "$RESTORE.runtime" || return 1
++    if cmp -s "$RESTORE.checked" "$RESTORE.runtime"; then
++        rm -f "$RESTORE.runtime" "$RESTORE.checked"
++        return 0
++    fi
++    log "Restoring ipset: cached and active members differ"
++    mv "$RESTORE.checked" "$NEW_LIST" || return 1
++    rm -f "$RESTORE.runtime"
+     full_rebuild_from_new_list
+ }
+ 
+ repair_runtime(){
+     was_active=false
+     routing_is_active && was_active=true
+-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
++    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
+     if ! restore_from_cache_if_needed; then
+         log "No usable cached list; downloading AntiFilter"
+         update_list
+@@ -246,10 +272,13 @@ update_list(){
+         log "ERROR: interface $IFACE not found"
+         return 1
+     }
+-    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist
++    ipset create "$SET" hash:net family inet hashsize "$HASH_SIZE" maxelem "$MAX_ELEM" -exist || return 1
+     # A reboot recreates an empty ipset. Populate it before applying a small
+     # incremental diff, otherwise unchanged cached entries would be missing.
+-    restore_from_cache_if_needed || true
++    if ! restore_from_cache_if_needed; then
++        # No usable cache: conditional HTTP responses cannot repair it.
++        rm -f "$ETAG_FILE" "$LM_FILE" "$HASH_FILE"
++    fi
+     rm -f "$TMP" "$HDR" "$CURL_CONF"
+ 
+     {
+@@ -263,17 +292,12 @@ update_list(){
+         echo "retry = 3"
+         echo "dump-header = \"$HDR\""
+         echo "output = \"$TMP\""
+-        if [ -s "$ETAG_FILE" ]; then
+-            etag=$(head -n 1 "$ETAG_FILE" | tr -d '\r')
+-            [ -n "$etag" ] && echo "header = \"If-None-Match: $etag\""
+-        fi
+-        if [ -s "$LM_FILE" ]; then
+-            modified=$(head -n 1 "$LM_FILE" | tr -d '\r')
+-            [ -n "$modified" ] && echo "header = \"If-Modified-Since: $modified\""
+-        fi
+     } > "$CURL_CONF"
+ 
+-    http_code=$(curl -K "$CURL_CONF" -w "%{http_code}" "$URL" 2>>"$LOG")
++    set --
++    if [ -s "$ETAG_FILE" ]; then set -- "$@" -H "If-None-Match: $(head -n 1 "$ETAG_FILE" | tr -d '\r')"; fi
++    if [ -s "$LM_FILE" ]; then set -- "$@" -H "If-Modified-Since: $(head -n 1 "$LM_FILE" | tr -d '\r')"; fi
++    http_code=$(curl -K "$CURL_CONF" "$@" -w "%{http_code}" "$URL" 2>>"$LOG")
+     if [ "$http_code" = "304" ]; then
+         log "AntiFilter list not modified"
+         restore_from_cache_if_needed || return 1
+@@ -288,7 +312,10 @@ update_list(){
+         return 1
+     fi
+ 
+-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$TMP" | sort -u > "$NEW_LIST"
++    if ! normalize_cidrs "$TMP" "$NEW_LIST"; then
++        log "ERROR: malformed AntiFilter response; old list retained"
++        return 1
++    fi
+     new_count=$(wc -l < "$NEW_LIST" | tr -d ' ')
+     log "Valid networks: $new_count"
+     if [ "$new_count" -lt "$MIN_NETS" ]; then
+@@ -300,7 +327,7 @@ update_list(){
+ 
+     new_hash=$(md5sum "$NEW_LIST" | awk '{print $1}')
+     old_hash=""
+-    [ -s "$HASH_FILE" ] && old_hash=$(head -n 1 "$HASH_FILE" | tr -d '\r')
++    [ -s "$OLD_LIST" ] && old_hash=$(md5sum "$OLD_LIST" | awk '{print $1}')
+     new_etag=$(grep -i '^ETag:' "$HDR" | tail -n 1 | sed 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//' | tr -d '\r')
+     new_modified=$(grep -i '^Last-Modified:' "$HDR" | tail -n 1 | \
+         sed 's/^[Ll][Aa][Ss][Tt]-[Mm][Oo][Dd][Ii][Ff][Ii][Ee][Dd]:[[:space:]]*//' | tr -d '\r')
+@@ -319,6 +346,7 @@ update_list(){
+         return 1
+     fi
+     echo "$new_hash" > "$HASH_FILE.tmp" && mv "$HASH_FILE.tmp" "$HASH_FILE" || return 1
++    rm -f "$ETAG_FILE" "$LM_FILE"
+     [ -n "$new_etag" ] && printf '%s\n' "$new_etag" > "$ETAG_FILE"
+     [ -n "$new_modified" ] && printf '%s\n' "$new_modified" > "$LM_FILE"
+ 
+@@ -353,6 +381,10 @@ acquire_aux_lock(){
+     echo $$ > "$LOCKDIR/pid"
+ }
+ 
++if [ "${AWG_PACKAGE_CHILD:-0}" != 1 ] && [ -d /tmp/.awg_package_lock ]; then
++    package_owner=$(cat /tmp/.awg_package_lock/pid 2>/dev/null)
++    if [ -n "$package_owner" ] && kill -0 "$package_owner" 2>/dev/null; then log 'Package update in progress; retry later'; exit 1; fi
++fi
+ acquire_aux_lock || exit 1
+ trap 'rm -rf "$LOCKDIR"' 0
+ trap 'exit 1' 1 2 15
+diff --git a/addon/awg-runtime.sh b/addon/awg-runtime.sh
+new file mode 100644
+index 0000000..409b784
+--- /dev/null
++++ b/addon/awg-runtime.sh
+@@ -0,0 +1,430 @@
++#!/bin/sh
++# Runtime helpers, sourced after the backend's function definitions.
++OP_FILE=/www/user/awg_operation.htm
++
++operation_write(){
++    case "$1" in ''|*[!0-9]*) return 1;; esac
++    local dest="${OP_FILE%.htm}_$1.htm"
++    # Keep bounded receipts; more than fifty completed actions need not persist.
++    ls -t "${OP_FILE%.htm}_"*.htm 2>/dev/null | tail -n +51 | while IFS= read -r old; do rm -f "$old"; done
++    local tmp="$dest.$$"
++    { printf '{"id":"%s","state":' "$1"; printf '%s' "$2" | json_string
++      printf ',"message":'; printf '%s' "$3" | json_string
++      printf ',"time":%s}\n' "$(date +%s)"; } > "$tmp" && mv "$tmp" "$dest"
++}
++
++validate_runtime_settings(){
++    local v item file line dev name policy mac seen=" "
++    v=$(get_setting awg_default_policy)
++    case "$v" in ''|direct|vpn_all|vpn_geo) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
++    v=$(get_setting awg_address)
++    case "$v" in */*) ;; *) log_msg 'ERROR: IPv4 address/prefix required'; return 1;; esac
++    valid_ipv4 "${v%/*}" || return 1
++    case "${v##*/}" in ''|*[!0-9]*) return 1;; esac
++    [ "${v##*/}" -le 32 ] || return 1
++    for item in $(get_setting awg_dns | tr ',' ' '); do valid_ipv4 "$item" || { log_msg 'ERROR: invalid DNS IPv4'; return 1; }; done
++    for item in $(get_setting awg_geo_custom_domains | tr ',' ' '); do valid_domain "$item" || { log_msg 'ERROR: invalid custom domain'; return 1; }; done
++    for item in $(get_setting awg_geo_v2fly | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
++        valid_geosite_name "$item" || { log_msg 'ERROR: unsupported GeoSite category syntax'; return 1; }
++    done
++    for item in $(get_setting awg_geo_v2fly_ip | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
++        valid_geo_service_name "$item" || return 1
++    done
++    for item in $(get_setting awg_vpn_source_nets | tr ',' ' '); do
++        case "$item" in */*) ;; *) return 1;; esac
++        valid_ipv4 "${item%/*}" || return 1
++        case "${item##*/}" in ''|*[!0-9]*) return 1;; esac
++        [ "${item##*/}" -le 32 ] || return 1
++    done
++    file=$(mktemp /tmp/awg_clients_check.XXXXXX) || return 1
++    get_setting awg_clients | tr ';' '\n' > "$file"
++    while IFS=',' read -r dev name policy mac || [ -n "$dev" ]; do
++        [ -z "$dev" ] && continue
++        valid_ipv4 "$dev" || { rm -f "$file"; log_msg "ERROR: invalid device IP"; return 1; }
++        case "$seen" in *" $dev "*) rm -f "$file"; log_msg 'ERROR: duplicate device IP'; return 1;; esac
++        seen="$seen$dev "
++        case "$policy" in direct|vpn_all|vpn_geo) ;; *) rm -f "$file"; return 1;; esac
++        if [ -n "$mac" ]; then
++            printf '%s\n' "$mac" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' || { rm -f "$file"; return 1; }
++        fi
++    done < "$file"
++    rm -f "$file"
++}
++
++preflight_geo(){
++    local svc f custom
++    for svc in $(selected_geoip_services); do
++        f="$GEO_DIR/geoip/v2fly_${svc}.cidr"
++        [ -s "$f" ] || { log_msg "ERROR: missing GeoIP list $svc"; return 1; }
++    done
++    for f in "$GEO_DIR"/geoip/*.cidr; do
++        [ -f "$f" ] || continue
++        normalize_cidrs "$f" "$f.checked" || { log_msg "ERROR: invalid GeoIP cache $f"; return 1; }
++        mv "$f.checked" "$f" || return 1
++    done
++    custom=$(get_setting awg_geo_custom_ips)
++    if [ -n "$custom" ]; then
++        printf '%s\n' "$custom" | tr ',' '\n' > "$GEO_DIR/custom.check"
++        normalize_cidrs "$GEO_DIR/custom.check" "$GEO_DIR/custom.valid" || return 1
++        rm -f "$GEO_DIR/custom.check" "$GEO_DIR/custom.valid"
++    fi
++    for svc in $(get_setting awg_geo_v2fly | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
++        awk -v cat="${svc%@*}" '/^[[:space:]]*- name:/{n=$0;sub(/.*name:[[:space:]]*/,"",n);gsub(/"/,"",n);if(n==cat)found=1}END{exit !found}' "$GEO_DIR/v2fly_all.yml" || { log_msg "ERROR: unknown GeoSite category $svc"; return 1; }
++    done
++}
++
++setup_firewall(){
++    validate_runtime_settings || return 1
++    cancel_prefill || return 1
++    local txn original_geo had_set=0 rc
++    txn=$(mktemp -d /tmp/awg_apply.XXXXXX) || return 1
++    original_geo="$GEO_DIR"
++    mkdir -p "$txn/geo/geoip" "$txn/geo/domains"
++    cp -a "$GEO_DIR/." "$txn/geo/" || { rm -rf "$txn"; return 1; }
++    if ! ( GEO_DIR="$txn/geo"; prune_unselected_geoip_lists "$(selected_geoip_services)"; preflight_geo ); then
++        log_msg 'ERROR: list validation failed; active rules retained'
++        rm -rf "$txn"; return 1
++    fi
++    # Save the previous runtime before executing any destructive operation.
++    iptables-save > "$txn/firewall" || { rm -rf "$txn"; return 1; }
++    ip route show table "$RT_TABLE" > "$txn/routes" || { rm -rf "$txn"; return 1; }
++    ip rule show | awk '$0 ~ /lookup 300/ || $0 ~ /fwmark 0x101/ {print}' > "$txn/rules"
++    if ipset list "$IPSET_NAME" -t >/dev/null 2>&1; then
++        ipset save "$IPSET_NAME" > "$txn/ipset" || { rm -rf "$txn"; return 1; }
++        had_set=1
++    fi
++    [ ! -f "$DNSMASQ_AWG_CONF" ] || cp "$DNSMASQ_AWG_CONF" "$txn/dns"
++    [ ! -f "$DNSMASQ_INCLUDE" ] || cp "$DNSMASQ_INCLUDE" "$txn/include"
++    [ ! -f "$FIREWALL_EXPECTED" ] || cp "$FIREWALL_EXPECTED" "$txn/expected"
++    [ ! -f "$IPSET_MIN_COUNT_FILE" ] || cp "$IPSET_MIN_COUNT_FILE" "$txn/min"
++    (
++        GEO_DIR="$txn/geo"
++        # Expected absence checks/deletions may fail; creation of required
++        # rules, addresses and routes must not be converted into success.
++        iptables(){
++            command iptables "$@"; code=$?
++            case " $* " in *' -A '*|*' -I '*) [ "$code" = 0 ] || exit 42;; esac
++            return "$code"
++        }
++        ip(){
++            command ip "$@"; code=$?
++            case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || exit 42;; esac
++            return "$code"
++        }
++        setup_firewall_body || exit 1
++        main_firewall_base_healthy || exit 1
++    )
++    rc=$?
++    if [ "$rc" != 0 ]; then
++        log_msg 'ERROR: apply failed; restoring previous runtime'
++        cleanup_firewall
++        if [ "$had_set" = 1 ]; then ipset restore -exist < "$txn/ipset" || rc=2; fi
++        restore_owned_rules "$txn/firewall" || rc=2
++        ip route flush table "$RT_TABLE"
++        while IFS= read -r line; do [ -z "$line" ] || ip route replace table "$RT_TABLE" $line || rc=2; done < "$txn/routes"
++        while IFS= read -r line; do
++            [ -n "$line" ] || continue
++            pref=${line%%:*}; rest=${line#*:}
++            ip rule add priority "$pref" $rest || rc=2
++        done < "$txn/rules"
++        if [ -f "$txn/dns" ]; then cp "$txn/dns" "$DNSMASQ_AWG_CONF"; else rm -f "$DNSMASQ_AWG_CONF"; fi
++        if [ -f "$txn/include" ]; then cp "$txn/include" "$DNSMASQ_INCLUDE"; else rm -f "$DNSMASQ_INCLUDE"; fi
++        [ ! -f "$txn/expected" ] || cp "$txn/expected" "$FIREWALL_EXPECTED"
++        [ ! -f "$txn/min" ] || cp "$txn/min" "$IPSET_MIN_COUNT_FILE"
++        restart_dnsmasq_and_wait 15 || rc=2
++        [ "$rc" != 2 ] || log_msg 'ERROR: rollback incomplete; manual recovery required'
++        rm -rf "$txn"; return 1
++    fi
++    prune_unselected_geoip_lists "$(selected_geoip_services)"
++    rm -f "$original_geo/domains/v2fly_"*.txt "$original_geo/domains/custom.txt"
++    cp -a "$txn/geo/." "$original_geo/" || { log_msg 'ERROR: cannot commit geo cache'; rm -rf "$txn"; return 1; }
++    rm -rf "$txn"
++    # Store exact static members, rather than a floor that hides partial loss.
++    ipset save "$IPSET_NAME" | awk '$1=="add" && /timeout 0([ ]|$)/{v=$3;if(index(v,"/")==0)v=v"/32";print v}' | sort -u > /tmp/.awg_static_members
++    cp "$DNSMASQ_AWG_CONF" /tmp/.awg_dns_expected || return 1
++    repair_aux_routing || return 1
++    ensure_status_loop
++    pre_resolve_domains_async
++}
++
++pre_resolve_domains_async(){
++    # A pending generation is consumed by one independent worker. An old
++    # background process never prevents subsequent generations from running.
++    touch /tmp/.awg_dns_pending
++    "$ADDON_DIR/amneziawg.sh" prefill_worker </dev/null >/dev/null 2>&1 &
++}
++
++prefill_worker(){
++    local old domain n=0 ok=0 failed=0 domains
++    if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
++        old=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
++        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
++        # Empty lock may be in the process of being initialized.
++        if [ -z "$old" ]; then
++            sleep 2
++            old=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
++            [ -z "$old" ] || return 0
++        fi
++        rm -rf "$DNS_PREFILL_LOCK"
++        mkdir "$DNS_PREFILL_LOCK" || return 1
++    fi
++    echo $$ > "$DNS_PREFILL_LOCK/pid"
++    trap 'rm -rf "$DNS_PREFILL_LOCK"' 0
++    trap 'exit 1' 1 2 15
++    while [ -f /tmp/.awg_dns_pending ]; do
++        rm -f /tmp/.awg_dns_pending
++        [ -s "$DNSMASQ_AWG_CONF" ] || continue
++        domains="$DNS_PREFILL_LOCK/domains"
++        awk -F/ '/^ipset=/{for(i=2;i<NF;i++)if($i!="")print $i}' "$DNSMASQ_AWG_CONF" | sort -u > "$domains"
++        ok=0; failed=0
++        log_msg 'Domain pre-resolution started'
++        while IFS= read -r domain; do
++            [ -n "$domain" ] || continue
++            if timeout 8 nslookup "$domain" 127.0.0.1 >/dev/null 2>&1; then ok=$((ok+1)); else failed=$((failed+1)); fi
++        done < "$domains"
++        log_msg "Domain pre-resolution finished: success=$ok failed=$failed"
++        update_status
++    done
++}
++
++ensure_status_loop(){
++    local pid
++    pid=$(cat /tmp/.awg_status_pid 2>/dev/null)
++    [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null || return 0
++    "$ADDON_DIR/amneziawg.sh" status_loop </dev/null >/dev/null 2>&1 &
++}
++status_loop(){
++    mkdir /tmp/.awg_status_lock 2>/dev/null || {
++        local old
++        old=$(cat /tmp/.awg_status_pid 2>/dev/null)
++        [ -n "$old" ] && kill -0 "$old" 2>/dev/null && return 0
++        rmdir /tmp/.awg_status_lock 2>/dev/null
++        mkdir /tmp/.awg_status_lock 2>/dev/null || return 1
++    }
++    echo $$ > /tmp/.awg_status_pid
++    trap 'rm -f /tmp/.awg_status_pid; rmdir /tmp/.awg_status_lock 2>/dev/null' 0
++    trap 'exit 1' 1 2 15
++    while [ -x "$ADDON_DIR/amneziawg.sh" ]; do
++        "$ADDON_DIR/amneziawg.sh" status
++        if [ -f /tmp/.awg_dns_pending ]; then
++            "$ADDON_DIR/amneziawg.sh" prefill_worker </dev/null >/dev/null 2>&1 &
++        fi
++        sleep 5
++    done
++}
++
++update_status(){
++    local tmp="$STATUS_FILE.$$" running=false addr="" pub="" port="" dump row handshake=0 now state=stopped count=0 domains=0 af_count=0 af_enabled=false af_active=false version warnings=0
++    now=$(date +%s)
++    if is_running && pidof amneziawg-go >/dev/null 2>&1; then
++        running=true; state=interface_up
++        addr=$(ip -4 addr show "$IFACE" | awk '/inet /{print $2;exit}')
++        pub=$("$AWG_BIN" show "$IFACE" public-key 2>/dev/null)
++        port=$("$AWG_BIN" show "$IFACE" listen-port 2>/dev/null)
++        handshake=$("$AWG_BIN" show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
++        case "$handshake" in ''|*[!0-9]*) handshake=0;; esac
++        [ "$handshake" -gt 0 ] && [ "$now" -ge "$handshake" ] && [ "$((now-handshake))" -le 180 ] && state=handshake_recent
++    fi
++    count=$(ipset list "$IPSET_NAME" -t 2>/dev/null | awk '/Number of entries/{print $NF}')
++    af_count=$(ipset list MYAWG -t 2>/dev/null | awk '/Number of entries/{print $NF}')
++    domains=$(awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i}' "$DNSMASQ_AWG_CONF" 2>/dev/null | sort -u | wc -l)
++    antifilter_enabled && af_enabled=true
++    if [ "$af_enabled" = true ] && [ "${af_count:-0}" -gt 0 ] && iptables -t nat -C POSTROUTING -m mark --mark 0x66/0xffffffff -o awg0 -j MASQUERADE 2>/dev/null && ip route show table 400 | grep -q '^default dev awg0' && iptables -t mangle -C PREROUTING -j MYAWG_CHAIN 2>/dev/null; then af_active=true; fi
++    [ ! -f "$GEO_DIR/domains/warnings.txt" ] || warnings=$(wc -l < "$GEO_DIR/domains/warnings.txt")
++    version=$(/opt/bin/opkg status amneziawg 2>/dev/null | awk '/^Version:/{print $2;exit}')
++    {
++        printf '{"running":%s,"state":"%s","measured_at":%s,"handshake_timestamp":%s,' "$running" "$state" "$now" "$handshake"
++        printf '"package_version":'; printf '%s' "$version" | json_string
++        printf ',"interface_addr":'; printf '%s' "$addr" | json_string
++        printf ',"public_key":'; printf '%s' "$pub" | json_string
++        printf ',"listen_port":'; printf '%s' "$port" | json_string
++        printf ',"go_version":'; cat "$AWG_DIR/amneziawg-go.version" 2>/dev/null | json_string
++        printf ',"tools_version":'; cat "$AWG_DIR/amneziawg-tools.version" 2>/dev/null | json_string
++        printf ',"default_policy":'; get_setting awg_default_policy | json_string
++        printf ',"clients":'; get_setting awg_clients | json_string
++        printf ',"ipset_count":%s,"geo_domains":%s,"geo_warnings":%s,"antifilter_count":%s,"antifilter_enabled":%s,"antifilter_active":%s,' "${count:-0}" "${domains:-0}" "$warnings" "${af_count:-0}" "$af_enabled" "$af_active"
++        printf '"active_rules":%s,"geo_downloaded":' "$(ip rule show | grep -c 'lookup 300')"
++        if geo_available; then printf true; else printf false; fi
++        printf ',"peers":['
++        "$AWG_BIN" show "$IFACE" dump 2>/dev/null | tail -n +2 | while read -r pkey psk endpoint aips hs rx tx keepalive; do
++            [ -n "$pkey" ] || continue
++            printf '{"endpoint":'; printf '%s' "$endpoint" | json_string
++            printf ',"allowed_ips":'; printf '%s' "$aips" | json_string
++            printf ',"transfer_rx":'; human_size "${rx:-0}" | json_string
++            printf ',"transfer_tx":'; human_size "${tx:-0}" | json_string
++            printf ',"latest_handshake":'; if [ "${hs:-0}" = 0 ]; then printf never; else printf '%ss ago' "$((now-hs))"; fi | json_string
++            printf '}'
++            break # one peer is supported by this addon
++        done
++        printf '],"log":'; grep amneziawg /tmp/syslog.log 2>/dev/null | tail -30 | json_string
++        printf '}\n'
++    } > "$tmp" && mv "$tmp" "$STATUS_FILE"
++}
++
++fetch_verified_package(){
++    local ver="$1" arch="$2" dir="$3" package base expected actual
++    case "$ver" in ''|*[!0-9.-]*) return 1;; esac
++    case "$arch" in aarch64-3.10|armv7-2.6|armv7-3.2) ;; *) return 1;; esac
++    package="amneziawg_${ver}_${arch}.ipk"
++    base="https://github.com/${UPDATE_REPO}/releases/download/v${ver}"
++    curl -fLsS --connect-timeout 10 --max-time 180 "$base/$package" -o "$dir/$package" || return 1
++    curl -fLsS --connect-timeout 10 --max-time 30 "$base/SHA256SUMS" -o "$dir/sums-$ver" || return 1
++    expected=$(awk -v f="$package" '$2==f || $2=="*"f {print $1;exit}' "$dir/sums-$ver")
++    actual=$(sha256sum "$dir/$package" | awk '{print $1}')
++    [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
++    tar tzf "$dir/$package" | grep -q 'data.tar.gz' || return 1
++}
++
++do_update(){
++    (
++        local current latest arch dir old_package new_package was_running=0 rc
++        LOCKDIR=/tmp/.awg_package_lock
++        DISPATCH_LOCK=0
++        acquire_lock || exit 1
++        # Drain an already running Apply/watchdog before replacing scripts.
++        package_lock="$LOCKDIR"
++        LOCKDIR=/tmp/.awg_lock
++        if ! acquire_lock; then LOCKDIR="$package_lock"; release_lock; exit 1; fi
++        release_lock
++        LOCKDIR=/tmp/.awg_ipset_update_lock
++        if ! acquire_lock; then LOCKDIR="$package_lock"; release_lock; exit 1; fi
++        release_lock
++        LOCKDIR="$package_lock"
++        dir=$(mktemp -d /tmp/awg_package.XXXXXX) || { release_lock; exit 1; }
++        trap 'rm -rf "$dir"; rm -f /tmp/.awg_no_autostart; release_lock' 0
++        trap 'exit 1' 1 2 15
++        current=$(/opt/bin/opkg status amneziawg | awk '/^Version:/{print $2;exit}')
++        arch=$(/opt/bin/opkg status amneziawg | awk '/^Architecture:/{print $2;exit}')
++        [ -n "$arch" ] || arch=$(/opt/bin/opkg print-architecture | awk '$2=="aarch64-3.10"{print $2;exit}')
++        latest=$(curl -fLsS --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([0-9.-]*\)".*/\1/p' | head -1)
++        [ -n "$latest" ] || exit 1
++        [ "$current" != "$latest" ] || { log_msg 'Package already up to date'; exit 0; }
++        # Download and verify BOTH versions before stopping anything.
++        fetch_verified_package "$latest" "$arch" "$dir" || { log_msg 'ERROR: new package validation failed'; exit 1; }
++        fetch_verified_package "$current" "$arch" "$dir" || { log_msg 'ERROR: rollback package unavailable; update cancelled'; exit 1; }
++        old_package="$dir/amneziawg_${current}_${arch}.ipk"
++        new_package="$dir/amneziawg_${latest}_${arch}.ipk"
++        cp "$SETTINGS" "$dir/settings" || exit 1
++        is_running && was_running=1
++        # Child hooks invoked by opkg are allowed; unrelated user mutations
++        # see the package lock and fail with an explicit busy result.
++        export AWG_PACKAGE_CHILD=1
++        "$ADDON_DIR/amneziawg.sh" stop || exit 1
++        touch /tmp/.awg_no_autostart
++        rc=0
++        /opt/bin/opkg install "$new_package" || rc=1
++        [ "$rc" != 0 ] || "$ADDON_DIR/amneziawg.sh" install_page || rc=1
++        [ "$(/opt/bin/opkg status amneziawg | awk '/^Version:/{print $2;exit}')" = "$latest" ] || rc=1
++        if [ "$rc" = 0 ]; then
++            log_msg "Update complete: $latest; start from UI"
++            "$ADDON_DIR/amneziawg.sh" status
++            exit 0
++        fi
++        log_msg 'ERROR: package installation failed; restoring previous package'
++        if /opt/bin/opkg install --force-downgrade "$old_package" && cp "$dir/settings" "$SETTINGS" && "$ADDON_DIR/amneziawg.sh" install_page; then
++            rm -f /tmp/.awg_no_autostart
++            [ "$was_running" != 1 ] || "$ADDON_DIR/amneziawg.sh" start
++            log_msg "Previous package restored: $current"
++        else
++            # Preserve the recovery bundle if automatic rollback failed.
++            cp -a "$dir" "/opt/awg-recovery-$(date +%s)"
++            log_msg 'ERROR: rollback failed; recovery files retained under /opt/awg-recovery-*'
++        fi
++        exit 1
++    )
++}
++
++# Exact managed-rule ordering and static membership are checked independently
++# of dynamic DNS entries, whose normal expiry must not trigger a rebuild.
++main_firewall_healthy(){
++    main_firewall_base_healthy || return 1
++    [ "$(managed_firewall_rules)" = "$(cat "$FIREWALL_EXPECTED")" ] || return 1
++    [ -f /tmp/.awg_static_members ] || return 1
++    local actual missing
++    actual=$(mktemp /tmp/awg_members.XXXXXX) || return 1
++    set_members "$IPSET_NAME" > "$actual" || { rm -f "$actual"; return 1; }
++    missing=$(awk 'FILENAME==ARGV[1]{have[$0]=1;next}!($0 in have){bad=1}END{print bad+0}' "$actual" /tmp/.awg_static_members)
++    rm -f "$actual"
++    [ "$missing" = 0 ] || return 1
++    cmp -s /tmp/.awg_dns_expected "$DNSMASQ_AWG_CONF" || return 1
++    if grep -q '^ipset=' "$DNSMASQ_AWG_CONF"; then
++        grep -qFx "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE" || return 1
++    fi
++}
++
++package_busy(){
++    [ -d /tmp/.awg_package_lock ] || return 1
++    local owner
++    owner=$(cat /tmp/.awg_package_lock/pid 2>/dev/null)
++    case "$owner" in '')
++        sleep 2
++        [ -s /tmp/.awg_package_lock/pid ] && return 0
++        rmdir /tmp/.awg_package_lock 2>/dev/null || return 0
++        return 1;;
++        *[!0-9]*) return 0;;
++    esac
++    if kill -0 "$owner" 2>/dev/null; then return 0; fi
++    rm -rf /tmp/.awg_package_lock
++    return 1
++}
++
++ensure_base_firewall(){
++    local lan
++    lan=$(get_lan_net)
++    iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || iptables -I INPUT -i "$IFACE" -j ACCEPT || return 1
++    iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "$IFACE" -j ACCEPT || return 1
++    iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -I FORWARD -o "$IFACE" -j ACCEPT || return 1
++    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || return 1
++    iptables -t mangle -C FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || return 1
++    if [ -n "$lan" ]; then
++        iptables -t nat -C POSTROUTING -s "$lan" -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -s "$lan" -o "$IFACE" -j MASQUERADE || return 1
++    else
++        iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -I POSTROUTING -o "$IFACE" -j MASQUERADE || return 1
++    fi
++}
++
++# Restore addon-owned chain and DNS rules without overwriting other addons'
++# tables or concurrent AntiFilter changes. cleanup_firewall has removed ours.
++restore_owned_rules(){
++    local snapshot="$1" table rules
++    rules=$(mktemp /tmp/awg_rules_restore.XXXXXX) || return 1
++    for table in mangle nat filter; do
++        {
++            printf '*%s\n' "$table"
++            if [ "$table" = mangle ] && grep -q '^:AWG ' "$snapshot"; then
++                printf ':AWG - [0:0]\n'
++            fi
++            awk -v wanted="$table" '
++                /^\*/{table=substr($0,2);delete index_by_chain;next}
++                table!=wanted{next}
++                /^-A /{
++                    chain=$2; index_by_chain[chain]++
++                    own=(wanted=="mangle" && ($2=="AWG" || ($2=="PREROUTING" && /-j AWG$/))) ||
++                        (wanted=="nat" && $2=="PREROUTING" && /-i br0 / && /--dport 53 / && /-j DNAT/) ||
++                        (wanted=="filter" && $2=="FORWARD" && /-i br0 / && /--dport (443|853) / && /-j REJECT/)
++                    if(own){
++                        if(chain=="AWG")print
++                        else {sub(/^-A [^ ]+ /, "");print "-I " chain " " index_by_chain[chain] " " $0}
++                    }
++                }' "$snapshot"
++            printf 'COMMIT\n'
++        } > "$rules"
++        iptables-restore --noflush < "$rules" || { rm -f "$rules"; return 1; }
++    done
++    rm -f "$rules"
++}
++
++cancel_prefill(){
++    local pid n=0
++    rm -f /tmp/.awg_dns_pending
++    pid=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
++    case "$pid" in ''|*[!0-9]*) return 0;; esac
++    kill -0 "$pid" 2>/dev/null || return 0
++    # Verify ownership before signalling a PID retained across an interrupted run.
++    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'amneziawg.sh prefill_worker' || return 0
++    kill "$pid" 2>/dev/null
++    while kill -0 "$pid" 2>/dev/null; do
++        [ "$n" -lt 10 ] || { log_msg 'ERROR: DNS worker did not stop; Apply deferred'; return 1; }
++        n=$((n+1)); sleep 1
++    done
++}
+diff --git a/build-ipk.sh b/build-ipk.sh
+index d560f41..399baa0 100755
+--- a/build-ipk.sh
++++ b/build-ipk.sh
+@@ -9,8 +9,10 @@ set -e
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ cd "$SCRIPT_DIR"
+ 
++bash tests/run.sh
++
+ PKG_NAME="amneziawg"
+-PKG_VERSION="2.2.0-17"
++PKG_VERSION="2.2.0-18"
+ 
+ AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
+ AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
+@@ -58,7 +60,7 @@ Version: ${PKG_VERSION}
+ Section: net
+ Architecture: ${arch}
+ Maintainer: amneziawg-merlin
+-Source: https://github.com/r0otx/asuswrt-merlin-amneziawg
++Source: https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1
+ Description: AmneziaWG VPN for Asuswrt-Merlin
+  DPI-obfuscated WireGuard VPN with per-device policy routing
+  and GeoIP/GeoSite selective routing for ASUS routers.
+@@ -83,17 +85,17 @@ mkdir -p /dev/net
+ mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
+ chmod 600 /dev/net/tun 2>/dev/null || true
+ if [ -f /usr/sbin/helper.sh ]; then
+-    /jffs/addons/amneziawg/amneziawg.sh install_page || true
++    /jffs/addons/amneziawg/amneziawg.sh install_page
+ fi
+ if grep -q '^awg_privatekey ' /jffs/addons/custom_settings.txt 2>/dev/null; then
+-    /jffs/addons/amneziawg/amneziawg.sh service_event package awgsaveconf || true
++    /jffs/addons/amneziawg/amneziawg.sh service_event package awgsaveconf
+ fi
+ echo ""
+ echo "============================================"
+ echo "  AmneziaWG installed!"
+ echo "============================================"
+ echo "  Web UI:  VPN > AmneziaWG"
+-echo "  Start:   /opt/etc/init.d/S99amneziawg start"
++echo "  Start:   /jffs/addons/amneziawg/amneziawg.sh start"
+ echo ""
+ POSTEOF
+     chmod 755 "$CONTROL_DIR/postinst"
+@@ -133,6 +135,8 @@ PRERMEOF
+     printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
+     cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
+     cp addon/awg-ipset-update.sh      "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
++    cp addon/awg-common.sh          "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
++    cp addon/awg-runtime.sh         "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
+     cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
+ 
+     chmod 755 "$DATA_DIR/opt/amneziawg/amneziawg-go"
+@@ -150,7 +154,7 @@ PRERMEOF
+ 
+ case "$1" in
+     start)
+-        /jffs/addons/amneziawg/amneziawg.sh start
++        /jffs/addons/amneziawg/amneziawg.sh boot_start
+         ;;
+     stop)
+         /jffs/addons/amneziawg/amneziawg.sh stop
+@@ -185,13 +189,13 @@ echo "=== AmneziaWG .ipk builder ==="
+ echo ""
+ 
+ # Build aarch64 (ARM64) — GT-AX11000, RT-AX86U, RT-AX88U, etc.
+-build_ipk "aarch64-3.10" "output/amneziawg-go" "output/awg" || true
++build_ipk "aarch64-3.10" "output/amneziawg-go" "output/awg"
+ 
+ # Build arm (ARM32, GOARM=5) — RT-AC68U, RT-AC66U, older ARM routers
+-build_ipk "armv7-2.6" "output/amneziawg-go-arm5" "output/awg-arm" || true
++if [ -f output/amneziawg-go-arm5 ]; then build_ipk "armv7-2.6" "output/amneziawg-go-arm5" "output/awg-arm"; fi
+ 
+ # Build arm (ARM32, newer Entware/HND) — RT-AX56U, RT-AX58U, etc.
+-build_ipk "armv7-3.2" "output/amneziawg-go-arm" "output/awg-arm" || true
++if [ -f output/amneziawg-go-arm ]; then build_ipk "armv7-3.2" "output/amneziawg-go-arm" "output/awg-arm"; fi
+ 
+ echo ""
+ echo "Done. Install on router:"
+diff --git a/build.sh b/build.sh
+index 041ebbe..eb45287 100755
+--- a/build.sh
++++ b/build.sh
+@@ -18,6 +18,13 @@ DOCKER_BUILDKIT=1 docker build \
+ 
+ chmod 755 output/amneziawg-go output/awg
+ 
++{
++    printf 'source_commit=%s\n' "$(git rev-parse HEAD)"
++    printf 'go_tag=%s\ntools_tag=%s\n' "$AWG_GO_TAG" "$AWG_TOOLS_TAG"
++    docker version --format '{{.Server.Version}}'
++    sha256sum Dockerfile output/amneziawg-go output/awg
++} > output/build-manifest.txt
++
+ echo "Build complete:"
+ ls -lh output/amneziawg-go output/awg
+ sha256sum output/amneziawg-go output/awg
+diff --git a/docs/AUDIT-18.md b/docs/AUDIT-18.md
+new file mode 100644
+index 0000000..4b3a460
+--- /dev/null
++++ b/docs/AUDIT-18.md
+@@ -0,0 +1,46 @@
++# Исправления аудита: 2.2.0-18
++
++База патча: опубликованная 2.2.0-17, commit `d3348acc54161df4f5f4b795037c7ea6e4aac57b`.
++Патч меняет аддон и сборочные скрипты; исходные версии ядра AmneziaWG не меняет.
++
++## Что изменено и как проверять
++
++| Аудит | Изменение | Проверка / граница |
++|---|---|---|
++| A01 | GeoIP целиком проверяется и нормализуется до замены файла. HTML и неверные IPv4/CIDR отклоняются. | `test_bad_download_keeps_geoip_cache`, `test_cidr_validation_keeps_existing_output`. |
++| A02 | Перед очисткой проверяются выбранные списки; сохраняются runtime и DNS; ошибка применения запускает восстановление только правил аддона. Восстановление основной таблицы выполняется до проверки её здоровья. | `test_firewall_failure_restores_old_set_and_dns`, `test_scoped_rollback_excludes_other_addons`. Это откат при обнаруженной ошибке, а не атомарная транзакция между ядром, DNS, файлами и настройками Merlin. Обрыв питания и ошибки самого отката не покрываются гарантией. |
++| A03 | Поддерживается выбор категории с `@attribute`; неподдерживаемые keyword/regexp и расширение full явно отражаются в предупреждениях. | `test_geosite_attribute_syntax`. Полная семантика GeoSite НЕ реализована: full в dnsmasq охватывает поддомены, keyword/regexp пропускаются. Категории со ссылкой на неизвестное имя отклоняются. |
++| A04 | Поле DNS формирует `server=/domain/IPv4` для выбранных доменов. Пустое поле оставляет DNS роутера. | Код `setup_firewall_body`; конфигурация проходит `dnsmasq --test` на роутере. Поле не настраивает DNS всех устройств и не обещает отправку самих DNS-запросов через туннель. |
++| A05 | AntiFilter сравнивает полный нормализованный состав кеша и ipset, а не нижний порог числа записей. Основной ipset отдельно проверяет наличие статических записей. | `test_partial_aux_loss_above_old_floor_is_restored`, `test_static_loss_cannot_be_hidden_by_dynamic_entries`. Нормальное истечение динамических DNS-записей допустимо. |
++| A06 | Ошибки создания маршрута/правил возвращают ошибку. Содержимое MYAWG_CHAIN заменяется через одну операцию iptables-restore; неизменная цепочка не пересоздаётся. | `test_aux_route_failure_is_failure`, `test_aux_rule_failure_is_sticky`; реальная семантика iptables-restore на Merlin требует проверки после установки. |
++| A07 | Позиция AWG заново читается после удаления старого перехода MYAWG. | `test_attach_recounts_awg_index_after_removal`. |
++| A08 | Новый набор сначала загружается во временный ipset. Ошибка загрузки/swap сохраняет прежний кеш; ошибка записи кеша вызывает обратный swap. Повреждённый кеш сбрасывает условные HTTP-заголовки. Hash сверяется с содержимым кеша. | `test_failed_staging_and_swap_preserve_cache`; общий crash-safe commit кеша, метаданных и ядра при обрыве питания не гарантируется. Следующий repair сверяет состав заново. |
++| A09 | Фоновый процесс обновляет JSON. UI различает интерфейс, недавний handshake и устаревший статус. Для AntiFilter разделены включение в настройках и наличие runtime. | `update_status`, `status_loop`, `updateStatusUI`; recent handshake не равен проверке открытия конкретного сайта. |
++| A10 | Для каждой операции записывается отдельная квитанция running/succeeded/failed с ID. UI ждёт её, а не истечения 15/60 секунд или остановки процесса. Update Geo сохраняет текущие поля. | `test_operation_receipts_are_independent`, `test_browser_validation_mac_and_operation_completion`. Тайм-аут означает отсутствие подтверждения, а не успех. |
++| A11 | MAC сохраняется при редактировании. Проверяются адреса устройств, дубли и политики. | Браузерный тест и `validate_runtime_settings`; сохранённый MAC используется, но отдельный редактор MAC не добавлялся. |
++| A12 | JSON экранируется общей функцией; счётчики показывают записи ipset и уникальные домены DNS-конфигурации. | `test_json_backslash_and_controls`. Число записей ipset включает сети и динамические адреса; это не число всех IPv4 внутри подсетей. |
++| A13 | Удалена очистка общей таблицы conntrack. | `test_no_global_conntrack_flush`. Уже открытые соединения могут потребовать переподключения после изменения политики. |
++| A14 | DNS-worker имеет PID, ограничение времени запроса и очередь нового заполнения. Перед Apply/Stop предыдущий worker останавливается. | `prefill_worker`, `cancel_prefill`; задержка остановки зависшего запроса ограничена ожиданием, при неудаче Apply возвращает ошибку. |
++| A15 | Оба пути загрузки используют одну настройку автозапуска. В UI добавлен флажок; по умолчанию включён, явный 0 отключает загрузку. Ручной Start остаётся отдельным действием. | Проверка содержимого пакета: S99 вызывает boot_start. На роутере проверить перезагрузкой с каждым положением флажка. |
++| A16 | Обновление берёт отдельную блокировку, дожидается текущих изменений, скачивает и проверяет новый и прежний пакеты до Stop. Ошибка установки вызывает попытку вернуть прежний пакет. Force-architecture fallback удалён. | `test_update_validates_rollback_before_stopping`, `test_update_failure_reinstalls_previous_package`. Если прежний релиз удалён, обновление отменяется; при ошибке отката recovery-файлы сохраняются в /opt. Ручной запуск opkg вне аддона не участвует в этой блокировке. |
++| A17 | В UI указаны границы IPv4/DNS; IPv6 endpoint отклоняется. Подсети входящих клиентов AntiFilter настраиваются; NAT остаётся по меткам, без привязки только к tun21. | Полная маршрутизация IPv6 НЕ добавлена. Клиенты OpenVPN/IPsec должны использовать DNS роутера. DNS-перехват по-прежнему относится к br0, DoH полностью не контролируется. |
++| A18 | Сборка пакета и серверная публикация запускают регрессионные тесты; обязательные ошибки сборки больше не игнорируются. Пишется build-manifest.txt. | Проверка тестовой упаковки. Полная побитовая воспроизводимость НЕ обеспечена: базовые Docker-образы и apt не закреплены снапшотами. Полноценная сборка ARM64 выполняется на VPS. |
++
++## Результат локальной проверки
++
++- `bash tests/run.sh`: **30 тестовых методов, OK**. Источник числа — итог Python unittest; внутри методов есть дополнительные subtests. Это 11 проверок восстановления и 19 проверок аудита.
++- Shell-синтаксис backend/helper/installer и Bash-синтаксис сборочных скриптов проверены в `tests/run.sh`.
++- Браузерная логика выполнена через Node.js с имитацией DOM и XMLHttpRequest. На VPS без Node этот один тест будет явно пропущен; shell/Python-проверки всё равно обязательны.
++- Проверена упаковка с тестовыми файлами вместо бинарников: пять файлов аддона, boot_start в S99, синтаксис postinst/prerm. Тестовый пакет не предназначен для установки и не включён в выдачу.
++- Реальные iptables, dnsmasq, opkg, OpenVPN/IPsec и перезагрузка роутера локально не испытывались. Работа на вашем роутере после установки пока не подтверждена. I cannot verify this.
++
++## Проверки на роутере после установки
++
++1. Сверить установленную версию через `/opt/bin/opkg status amneziawg`.
++2. Apply без изменений: дождаться Completed, проверить свежий статус и LOG.
++3. Удалить одну GeoIP-категорию, Apply: выбранный файл и соответствующие статические записи должны исчезнуть, остальные категории сохраниться.
++4. Выключить/включить AntiFilter через Apply: проверить таблицу 400, MYAWG, cron; таблица 300 должна оставаться независимой.
++5. Проверить трафик с LAN, OpenVPN и IPsec, затем перезагрузить роутер и повторить проверки.
++6. Проверку восстановления через намеренную порчу firewall/ipset проводить только при доступном запасном способе управления роутером. Эти разрушительные команды в патч не включены.
++
++Основные исходники для самостоятельной проверки: `addon/amneziawg.sh`, `addon/awg-runtime.sh`, `addon/awg-common.sh`, `addon/awg-ipset-update.sh`, `addon/amneziawg_page.asp`, `tests/test_audit.py`, `tests/test_recovery.py`.
+diff --git a/install-online.sh b/install-online.sh
+index 28c28d8..1340687 100755
+--- a/install-online.sh
++++ b/install-online.sh
+@@ -7,9 +7,10 @@ TMP_DIR=""
+ 
+ cleanup(){
+     [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+-    rm -f /tmp/.awg_no_autostart
++    if [ "${INSTALL_LOCKED:-0}" = 1 ]; then rm -f /tmp/.awg_no_autostart; rm -rf /tmp/.awg_package_lock; fi
+ }
+-trap cleanup EXIT INT TERM
++trap cleanup 0
++trap 'exit 1' 1 2 15
+ 
+ echo "============================================"
+ echo "  AmneziaWG Installer"
+@@ -38,6 +39,14 @@ if [ "$CPU_ARCH" != "aarch64" ] || [ "$PKG_ARCH" != "$SUPPORTED_ARCH" ]; then
+     exit 1
+ fi
+ 
++if [ -f /jffs/addons/amneziawg/awg-runtime.sh ]; then
++    exec /jffs/addons/amneziawg/amneziawg.sh update
++fi
++mkdir /tmp/.awg_package_lock 2>/dev/null || { echo 'ERROR: another package installation is active'; exit 1; }
++INSTALL_LOCKED=1
++echo $$ > /tmp/.awg_package_lock/pid
++export AWG_PACKAGE_CHILD=1
++
+ echo "Fetching latest release..."
+ RELEASE_JSON=$(curl -sfL --connect-timeout 10 --max-time 30 \
+     "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)
+@@ -90,8 +99,7 @@ echo "SHA256: OK"
+ 
+ echo "Installing..."
+ touch /tmp/.awg_no_autostart
+-/opt/bin/opkg install "$TMP_DIR/$IPK_FILE" || \
+-    /opt/bin/opkg install --force-architecture "$TMP_DIR/$IPK_FILE"
++/opt/bin/opkg install "$TMP_DIR/$IPK_FILE"
+ RC=$?
+ rm -f /tmp/.awg_no_autostart
+ 
+diff --git a/server/awg-merlin-builder.sh b/server/awg-merlin-builder.sh
+index a649fea..114abab 100755
+--- a/server/awg-merlin-builder.sh
++++ b/server/awg-merlin-builder.sh
+@@ -16,7 +16,7 @@ FORCE=false
+ exec 9>"/tmp/awg-merlin-builder.lock"
+ flock -n 9 || { echo "Another AWG builder instance is running"; exit 0; }
+ 
+-for cmd in docker git gh jq curl sha256sum file flock; do
++for cmd in docker git gh jq curl sha256sum file flock python3; do
+     command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing command: $cmd"; exit 1; }
+ done
+ gh auth status >/dev/null 2>&1 || { echo "ERROR: run 'gh auth login' first"; exit 1; }
+@@ -68,6 +68,7 @@ else
+ fi
+ 
+ rm -rf output
++bash tests/run.sh
+ AWG_GO_TAG="$latest_go" AWG_TOOLS_TAG="$latest_tools" ./build.sh
+ ./build-ipk.sh
+ 
+diff --git a/tests/run.sh b/tests/run.sh
+new file mode 100644
+index 0000000..04cc593
+--- /dev/null
++++ b/tests/run.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++for f in addon/*.sh install-online.sh; do sh -n "$f"; done
++for f in build.sh build-ipk.sh server/*.sh; do bash -n "$f"; done
++python3 -m unittest discover -s tests -p 'test_*.py'
+diff --git a/tests/test_audit.py b/tests/test_audit.py
+new file mode 100644
+index 0000000..bd0210b
+--- /dev/null
++++ b/tests/test_audit.py
+@@ -0,0 +1,253 @@
++"""Audit regressions with simulated failures; never operate the host firewall."""
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import tempfile
++import unittest
++from test_recovery import functions, MAIN, AUX, ROOT
++COMMON=(ROOT/'addon/awg-common.sh').read_text()
++RUNTIME=(ROOT/'addon/awg-runtime.sh').read_text()
++UI=(ROOT/'addon/amneziawg_page.asp').read_text()
++
++class Audit(unittest.TestCase):
++    def shell(self, body, env=None):
++        return subprocess.run(['sh'],input=body,text=True,capture_output=True,timeout=15,
++                              env=dict(os.environ,**(env or {})))
++
++    def test_cidr_validation_keeps_existing_output(self):
++        for data in ['<html>Error</html>\n','1.2.3.4/33\n','999.1.1.1\n','1.2.3.4\nbad\n']:
++            with self.subTest(data=data), tempfile.TemporaryDirectory() as d:
++                Path(d,'in').write_text(data);Path(d,'out').write_text('previous')
++                result=self.shell(COMMON+'\nnormalize_cidrs "$D/in" "$D/out"',{'D':d})
++                self.assertNotEqual(result.returncode,0)
++                self.assertEqual(Path(d,'out').read_text(),'previous')
++
++    def test_cidr_canonicalization(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'in').write_text('1.2.3.129/24\n1.2.3.0/24\n8.8.8.8\n')
++            result=self.shell(COMMON+'\nnormalize_cidrs "$D/in" "$D/out"',{'D':d})
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertEqual(Path(d,'out').read_text(),'1.2.3.0/24\n8.8.8.8/32\n')
++
++    def test_bad_download_keeps_geoip_cache(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'geoip').mkdir();cache=Path(d,'geoip/v2fly_test.cidr');cache.write_text('8.8.8.0/24\n')
++            result=self.shell(COMMON+functions(MAIN,'download_geoip_service')+'''
++valid_geo_service_name(){ :; }
++log_msg(){ :; }
++curl(){ printf '<html>error</html>\\n' > "$GEO_DIR/geoip/.dl_test.tmp"; }
++download_geoip_service test
++''',{'GEO_DIR':d})
++            self.assertEqual(result.returncode,1,result.stderr)
++            self.assertEqual(cache.read_text(),'8.8.8.0/24\n')
++
++    def test_geosite_attribute_syntax(self):
++        for value, valid in [('google@cn', True), ('openai', True), ('../../tmp', False), ('openai@', False)]:
++            result=self.shell(COMMON+'\nvalid_geosite_name "$VALUE"', {'VALUE':value})
++            self.assertEqual(result.returncode==0,valid)
++
++    def test_json_backslash_and_controls(self):
++        text='VPN \\ foo "quoted"\nnext\ttab\rreturn'
++        result=self.shell(COMMON+'\nprintf %s "$VALUE" | json_string',{'VALUE':text})
++        self.assertEqual(json.loads(result.stdout),text)
++
++    def test_aux_route_failure_is_failure(self):
++        result=self.shell(functions(AUX,'ensure_routing')+'''
++antifilter_allowed(){ :; }
++ipset(){ :; }
++log(){ :; }
++ip(){ case "$1 $2" in 'route replace') return 1;; 'rule show') echo '10: from all fwmark 0x66 lookup 400';; esac; }
++ensure_routing
++''',{'MARK':'0x66','TABLE':'400'})
++        self.assertEqual(result.returncode,1,result.stderr)
++
++    def test_aux_rule_failure_is_sticky(self):
++        result=self.shell(functions(AUX,'add_rule_once')+'''
++ROUTING_FAILED=0
++iptables(){ return 1; }
++add_rule_once mangle MYAWG -j RETURN
++[ "$ROUTING_FAILED" = 1 ]
++''')
++        self.assertEqual(result.returncode,0,result.stderr)
++
++    def test_partial_aux_loss_above_old_floor_is_restored(self):
++        for lost in (False,True):
++            with self.subTest(lost=lost),tempfile.TemporaryDirectory() as d:
++                cache=''.join(f'10.{i//256}.{i%256}.0/24\n' for i in range(1200))
++                Path(d,'cache').write_text(cache)
++                Path(d,'actual').write_text(cache if not lost else '\n'.join(cache.splitlines()[1:])+'\n')
++                result=self.shell(COMMON+functions(AUX,'restore_from_cache_if_needed')+'''
++set_members(){ LC_ALL=C sort -u "$D/actual"; }
++log(){ :; }
++full_rebuild_from_new_list(){ echo rebuilt; }
++restore_from_cache_if_needed
++''',{'D':d,'OLD_LIST':d+'/cache','NEW_LIST':d+'/new','RESTORE':d+'/restore'})
++                self.assertEqual(result.returncode,0,result.stderr)
++                self.assertEqual(result.stdout.strip(),'rebuilt' if lost else '')
++
++    def test_set_read_failure_not_hidden(self):
++        result=self.shell(COMMON+'\nipset(){ return 1; }\nset_members test')
++        self.assertNotEqual(result.returncode,0)
++
++    def test_no_global_conntrack_flush(self):
++        result=self.shell(functions(MAIN,'flush_conntrack')+'\nconntrack(){ echo touched; }\nflush_conntrack')
++        self.assertEqual(result.stdout,'')
++
++    def test_unknown_geosite_rejected(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'geoip').mkdir();Path(d,'v2fly_all.yml').write_text('lists:\n - name: "youtube"\n')
++            result=self.shell(COMMON+functions(RUNTIME,'preflight_geo')+'''
++selected_geoip_services(){ :; }
++get_setting(){ [ "$1" = awg_geo_v2fly ] && echo typo; }
++log_msg(){ :; }
++preflight_geo
++''',{'GEO_DIR':d})
++            self.assertEqual(result.returncode,1,result.stderr)
++
++    def test_operation_receipts_are_independent(self):
++        with tempfile.TemporaryDirectory() as d:
++            result=self.shell(COMMON+functions(RUNTIME,'operation_write')+'''
++operation_write 123 running Apply
++operation_write 456 failed Busy
++operation_write 123 succeeded Apply
++''',{'OP_FILE':d+'/awg_operation.htm'})
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertEqual(json.loads(Path(d,'awg_operation_123.htm').read_text())['state'],'succeeded')
++            self.assertEqual(json.loads(Path(d,'awg_operation_456.htm').read_text())['state'],'failed')
++
++    def test_firewall_failure_restores_old_set_and_dns(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'geo').mkdir();Path(d,'dns').write_text('old dns')
++            env={'GEO_DIR':d+'/geo','DNSMASQ_AWG_CONF':d+'/dns','DNSMASQ_INCLUDE':d+'/include',
++                 'IPSET_MIN_COUNT_FILE':d+'/min','FIREWALL_EXPECTED':d+'/expected','TRACE':d+'/trace'}
++            result=self.shell(functions(RUNTIME,'setup_firewall').replace('iptables-save','iptables_save')+'''
++validate_runtime_settings(){ :; }
++cancel_prefill(){ :; }
++preflight_geo(){ :; }
++prune_unselected_geoip_lists(){ :; }
++selected_geoip_services(){ :; }
++iptables_save(){ echo '*mangle'; echo COMMIT; }
++ip(){ :; }
++ipset(){ case "$1" in save) echo 'old set';; restore) cat >> "$TRACE";; esac; }
++log_msg(){ :; }
++cleanup_firewall(){ rm -f "$DNSMASQ_AWG_CONF"; }
++restore_owned_rules(){ echo restored-rules >> "$TRACE"; }
++restart_dnsmasq_and_wait(){ :; }
++setup_firewall_body(){ echo broken > "$DNSMASQ_AWG_CONF"; return 1; }
++setup_firewall
++''',env)
++            self.assertEqual(result.returncode,1,result.stderr)
++            self.assertEqual(Path(d,'dns').read_text(),'old dns')
++            self.assertIn('old set',Path(d,'trace').read_text())
++            self.assertIn('restored-rules',Path(d,'trace').read_text())
++
++    def test_scoped_rollback_excludes_other_addons(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'snapshot').write_text('*mangle\n:AWG - [0:0]\n-A AWG -j RETURN\n-A PREROUTING -j AWG\n-A MYAWG_CHAIN -j RETURN\nCOMMIT\n*filter\n-A OTHER -j DROP\nCOMMIT\n')
++            result=self.shell(functions(RUNTIME,'restore_owned_rules').replace('iptables-restore','iptables_restore')+'''
++iptables_restore(){ cat; }
++restore_owned_rules "$D/snapshot"
++''',{'D':d})
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertNotIn('MYAWG',result.stdout)
++            self.assertNotIn('OTHER',result.stdout)
++            self.assertIn('-A AWG -j RETURN',result.stdout)
++
++    def test_update_validates_rollback_before_stopping(self):
++        self.package_scenario('missing_old')
++
++    def test_update_failure_reinstalls_previous_package(self):
++        self.package_scenario('install_fail')
++
++    def package_scenario(self, mode):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'tmp').mkdir();Path(d,'settings').write_text('old settings')
++            Path(d,'amneziawg.sh').write_text('#!/bin/sh\necho "$1" >> "$TRACE"\n')
++            Path(d,'amneziawg.sh').chmod(0o755)
++            body=functions(RUNTIME,'do_update').replace('/opt/bin/opkg','opkg_mock').replace('/tmp/',d+'/tmp/')
++            result=self.shell(body+'''
++acquire_lock(){ :; }
++release_lock(){ :; }
++log_msg(){ :; }
++is_running(){ return 0; }
++curl(){ echo '{"tag_name":"v2.2.0-18"}'; }
++fetch_verified_package(){
++    [ "$MODE" != missing_old ] || [ "$1" != 2.2.0-17 ] || return 1
++    touch "$3/amneziawg_${1}_${2}.ipk"
++}
++opkg_mock(){
++    if [ "$1" = status ]; then echo 'Version: 2.2.0-17'; echo 'Architecture: aarch64-3.10'; return 0; fi
++    echo "$*" >> "$TRACE"
++    [ "$2" = --force-downgrade ]
++}
++do_update
++''',{'SETTINGS':d+'/settings','ADDON_DIR':d,'TRACE':d+'/trace','MODE':mode})
++            self.assertEqual(result.returncode,1,result.stderr)
++            if mode=='missing_old':
++                self.assertFalse(Path(d,'trace').exists(), 'must not stop before rollback is available')
++            else:
++                trace=Path(d,'trace').read_text()
++                self.assertIn('stop',trace)
++                self.assertIn('--force-downgrade',trace)
++                self.assertIn('install_page',trace)
++                self.assertTrue(trace.endswith('start\n'),trace)
++
++    def test_static_loss_cannot_be_hidden_by_dynamic_entries(self):
++        for actual in ['', '9.9.9.9/32\n', '8.8.8.8/32\n9.9.9.9/32\n']:
++            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as d:
++                Path(d,'expected').write_text('rules\n')
++                Path(d,'static').write_text('8.8.8.8/32\n')
++                Path(d,'dns').write_text('config\n')
++                body=functions(RUNTIME,'main_firewall_healthy').replace('/tmp/.awg_static_members',d+'/static').replace('/tmp/.awg_dns_expected',d+'/dns')
++                result=self.shell(body+'''
++main_firewall_base_healthy(){ :; }
++managed_firewall_rules(){ echo rules; }
++set_members(){ printf '%s' "$ACTUAL"; }
++main_firewall_healthy
++''',{'FIREWALL_EXPECTED':d+'/expected','DNSMASQ_AWG_CONF':d+'/dns','ACTUAL':actual})
++                self.assertEqual(result.returncode==0,actual.startswith('8.8.8.8'))
++
++    def test_attach_recounts_awg_index_after_removal(self):
++        with tempfile.TemporaryDirectory() as d:
++            Path(d,'chain').write_text('1 MYAWG_CHAIN\n2 AWG\n3 OTHER\n')
++            result=self.shell(functions(AUX,'attach_chain_after_awg')+'''
++delete_rule_all(){ printf '1 AWG\n2 OTHER\n' > "$D/chain"; }
++iptables(){
++    case " $* " in *' -L '*) cat "$D/chain";; *' -I '*) echo "$*";; esac
++}
++attach_chain_after_awg PREROUTING
++''',{'D':d,'CHAIN':'MYAWG_CHAIN'})
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertIn('-I PREROUTING 2 -j MYAWG_CHAIN',result.stdout)
++
++    @unittest.skipUnless(shutil.which('node'), 'Node.js needed for browser logic test')
++    def test_browser_validation_mac_and_operation_completion(self):
++        source=re.search(r'<script>\s*(var custom_settings.*?)</script>',UI,re.S).group(1)
++        source=re.sub(r'<%.*?%>','{}',source,flags=re.S)
++        checks='''
++const assert = require('assert');
++assert(validIPv4('192.168.50.1'));
++assert(!validIPv4('999.1.1.1'));
++global.document={querySelectorAll:()=>[{querySelector:(q)=>({value:q==='.client_ip'?'192.168.50.2':q==='.client_name'?'phone':'direct'}),getAttribute:()=> 'aa:bb:cc:dd:ee:ff'}]};
++assert(serializeClients().endsWith(',aa:bb:cc:dd:ee:ff'));
++var pending, callback, completed=false, el={};
++global.setTimeout=(f)=>{pending=f;};
++global.refreshStatus=()=>{};
++document.getElementById=()=>el;
++document.form={action_script:{},submit:()=>{}};
++global.XMLHttpRequest=function(){this.open=()=>{};this.send=()=>{callback=this;};};
++submitOperation('start_awgdoupdate',()=>{completed=true;});
++let id=document.form.action_script.value.split('_').pop();
++pending();
++callback.responseText=JSON.stringify({id,state:'running'});callback.onload();callback.onloadend();
++assert(!completed);assert(activeOperation);
++pending();callback.responseText=JSON.stringify({id,state:'succeeded'});callback.onload();callback.onloadend();
++assert(completed);assert(!activeOperation);
++'''
++        result=subprocess.run(['node'],input=source+'\n'+checks,text=True,capture_output=True,timeout=10)
++        self.assertEqual(result.returncode,0,result.stderr)
++
++if __name__=='__main__':unittest.main()
+diff --git a/tests/test_recovery.py b/tests/test_recovery.py
+index 03f0287..2805b00 100644
+--- a/tests/test_recovery.py
++++ b/tests/test_recovery.py
+@@ -127,15 +127,15 @@ managed_firewall_rules
+             stubs = '\n'.join(name + '(){ :; }' for name in ('cleanup_firewall', 'prune_unselected_geoip_lists',
+                 'selected_geoip_services', 'save_clients', 'setup_dns_interception', 'restart_dnsmasq_and_wait',
+                 'flush_conntrack', 'save_and_set_rp_filter', 'ensure_ui_mark_nat', 'repair_aux_routing',
+-                'register_managed_cron', 'managed_firewall_rules', 'log_msg'))
+-            r = self.run_shell(functions(MAIN, 'setup_firewall') + '\n' + stubs + r'''
++                'register_managed_cron', 'managed_firewall_rules', 'log_msg', 'ensure_main_routes', 'ensure_base_firewall', 'dnsmasq'))
++            r = self.run_shell(functions(MAIN, 'setup_firewall_body') + '\n' + stubs + r'''
+ get_setting(){ [ "$1" = awg_default_policy ] && echo vpn_all; }
+ get_lan_net(){ echo 192.168.50.0/24; }
+ get_endpoint(){ echo 203.0.113.1; }
+ ipset(){ [ "$1" = list ] && echo 'Number of entries: 0'; return 0; }
+ ip(){ echo "$*" >> "$TRACE"; }
+ iptables(){ echo "$*" >> "$TRACE"; }
+-setup_firewall
++setup_firewall_body
+ ''', env)
+             self.assertEqual(r.stderr, '')
+             trace = Path(env['TRACE']).read_text().splitlines()
+@@ -153,6 +153,7 @@ setup_firewall
+                 Path(d, 'awg0.addr').write_text('10.8.1.10/32')
+                 r = self.run_shell(functions(MAIN, 'do_service_event') + '''
+ get_setting(){ echo present; }
++validate_runtime_settings(){ :; }
+ generate_config(){ [ "$CHANGED" = yes ] && echo new > "$CONF"; return 0; }
+ is_running(){ return 0; }
+ update_geo_if_needed(){ :; }
