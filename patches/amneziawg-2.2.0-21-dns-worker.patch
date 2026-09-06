@@ -1,0 +1,296 @@
+diff --git a/README.md b/README.md
+index a562d4e..723da34 100644
+--- a/README.md
++++ b/README.md
+@@ -295,3 +295,9 @@ MIT License
+ При поздней готовности веб-интерфейса выполняются до 12 попыток с паузой 5 секунд. Задание `awg_ui_watchdog` раз в минуту проверяет страницу и запись меню, в том числе при остановленном туннеле. Оно удаляется при удалении аддона. Рабочая страница не удаляется перед регистрацией новой; отсутствие ожидаемого пункта меню вызывает ошибку без перезаписи текущего меню.
+ 
+ Проверки: 40 тестовых методов в `bash tests/run.sh`, включая 7 проверок UI с имитацией файлов и mount. Реальную загрузку Merlin и взаимодействие с другими аддонами нужно проверить после установки. Ручное восстановление вкладки на роутере подтверждено пользователем, но причина первоначального сбоя по журналу не установлена; конкуренция запуска и регистрации — обнаруженный в коде риск, устранённый этой версией.
++
++### Остановка DNS-заполнения при Apply: 2.2.0-21
++
++Apply запрашивает остановку фонового DNS-worker. Worker проверяет запрос во время ожидания DNS, завершает свой дочерний `nslookup` и освобождает блокировку после `wait`. Бюджет ожидания запроса — восемь секунд: 80 интервалов по 0,1 секунды, либо восемь по секунде, если дробный sleep недоступен. Если остановку подтвердить нельзя, применение по-прежнему откладывается. Процесс в состоянии zombie не считается активным. При обновлении старый worker сохраняет прежний путь остановки до первого запуска новой версии.
++
++Проверки: отмена активного запроса, повторный запуск, завершение и тайм-аут запросов, чужой PID, разбор состояния процесса и запуск без задания. Проверки процессов выполняются с имитацией `/proc`; необходима проверка Apply на роутере.
+diff --git a/README_EN.md b/README_EN.md
+index 552f0b0..5318a63 100644
+--- a/README_EN.md
++++ b/README_EN.md
+@@ -295,3 +295,9 @@ Page registration has a separate lock and no longer starts the tunnel. S99 launc
+ UI readiness is retried up to 12 times with 5-second gaps. The independent `awg_ui_watchdog` cron checks the page and menu once per minute, even when the tunnel is stopped, and is removed on uninstall. Missing menu anchors preserve the current menu; healthy pages are not deleted or rebound.
+ 
+ Validation: 40 test methods, including 7 simulated UI recovery tests. Real Merlin boot and coexistence with other addons still require router verification. The user confirmed manual page restoration, but the original boot failure was not proven to be a lock collision; this release removes that observed code-level risk.
++
++### DNS prefill cancellation during Apply: 2.2.0-21
++
++Apply requests cooperative DNS-worker cancellation. The worker checks the request while waiting for DNS, terminates its own child `nslookup`, and releases its lock after `wait`. Each query has an eight-second sleep budget: 80 intervals of 0.1 seconds, or eight one-second intervals when fractional sleep is unavailable. Apply remains deferred when cancellation cannot be confirmed. Zombie processes are not considered active. During upgrades, a legacy worker retains the previous cancellation path until a new worker is started.
++
++Tests cover active-query cancellation, repeated execution, completion, query timeout, unrelated PIDs, process-state parsing and idle startup. Process tests mock `/proc` inspection; Apply still requires verification on the router.
+diff --git a/addon/awg-runtime.sh b/addon/awg-runtime.sh
+index a614771..7179f87 100644
+--- a/addon/awg-runtime.sh
++++ b/addon/awg-runtime.sh
+@@ -177,10 +177,12 @@ pre_resolve_domains_async(){
+ }
+ 
+ prefill_worker(){
+-    local old domain n=0 ok=0 failed=0 domains
++    local old domain n=0 ok=0 failed=0 domains poll_delay=1 poll_limit=8
++    DNS_QUERY_PID=""
++    [ -f /tmp/.awg_dns_pending ] || return 0
+     if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
+         old=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
+-        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
++        if [ -n "$old" ] && prefill_process_active "$old"; then return 0; fi
+         # Empty lock may be in the process of being initialized.
+         if [ -z "$old" ]; then
+             sleep 2
+@@ -191,9 +193,12 @@ prefill_worker(){
+         mkdir "$DNS_PREFILL_LOCK" || return 1
+     fi
+     echo $$ > "$DNS_PREFILL_LOCK/pid"
+-    trap 'rm -rf "$DNS_PREFILL_LOCK"' 0
++    touch "$DNS_PREFILL_LOCK/cooperative"
++    trap 'prefill_cleanup' 0
+     trap 'exit 1' 1 2 15
+-    while [ -f /tmp/.awg_dns_pending ]; do
++    # Probe fractional sleep instead of assuming every Merlin build supports it.
++    if sleep 0.1 2>/dev/null; then poll_delay=0.1; poll_limit=80; fi
++    while [ -f /tmp/.awg_dns_pending ] && [ ! -f "$DNS_PREFILL_LOCK/stop" ]; do
+         rm -f /tmp/.awg_dns_pending
+         [ -s "$DNSMASQ_AWG_CONF" ] || continue
+         domains="$DNS_PREFILL_LOCK/domains"
+@@ -202,7 +207,25 @@ prefill_worker(){
+         log_msg 'Domain pre-resolution started'
+         while IFS= read -r domain; do
+             [ -n "$domain" ] || continue
+-            if timeout 8 nslookup "$domain" 127.0.0.1 >/dev/null 2>&1; then ok=$((ok+1)); else failed=$((failed+1)); fi
++            [ ! -f "$DNS_PREFILL_LOCK/stop" ] || return 0
++            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
++            DNS_QUERY_PID=$!
++            n=0
++            while prefill_process_active "$DNS_QUERY_PID"; do
++                [ ! -f "$DNS_PREFILL_LOCK/stop" ] || return 0
++                [ "$n" -lt "$poll_limit" ] || break
++                n=$((n+1)); sleep "$poll_delay"
++            done
++            if prefill_process_active "$DNS_QUERY_PID"; then
++                kill -9 "$DNS_QUERY_PID" 2>/dev/null
++                wait "$DNS_QUERY_PID" 2>/dev/null
++                failed=$((failed+1))
++            elif wait "$DNS_QUERY_PID" 2>/dev/null; then
++                ok=$((ok+1))
++            else
++                failed=$((failed+1))
++            fi
++            DNS_QUERY_PID=""
+         done < "$domains"
+         log_msg "Domain pre-resolution finished: success=$ok failed=$failed"
+         update_status
+@@ -436,17 +459,61 @@ restore_owned_rules(){
+     rm -f "$rules"
+ }
+ 
++# A zombie cannot issue DNS queries; kill -0 alone also reports zombies alive.
++prefill_process_active(){
++    local info
++    case "$1" in ''|*[!0-9]*) return 1;; esac
++    info=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
++    info=${info##*) }
++    case "$info" in Z\ *|X\ *) return 1;; esac
++    return 0
++}
++
++prefill_cleanup(){
++    # DNS_QUERY_PID is our own unreaped child, never a PID loaded from a stale file.
++    if [ -n "$DNS_QUERY_PID" ]; then
++        kill -9 "$DNS_QUERY_PID" 2>/dev/null
++        wait "$DNS_QUERY_PID" 2>/dev/null
++        DNS_QUERY_PID=""
++    fi
++    [ "$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)" != "$$" ] || rm -rf "$DNS_PREFILL_LOCK"
++}
++
++prefill_worker_owned(){
++    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null |
++        grep -q 'amneziawg.sh prefill_worker'
++}
++
+ cancel_prefill(){
+-    local pid n=0
++    local pid n=0 cooperative=0
+     rm -f /tmp/.awg_dns_pending
++    [ -d "$DNS_PREFILL_LOCK" ] || return 0
+     pid=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
+-    case "$pid" in ''|*[!0-9]*) return 0;; esac
+-    kill -0 "$pid" 2>/dev/null || return 0
+-    # Verify ownership before signalling a PID retained across an interrupted run.
+-    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'amneziawg.sh prefill_worker' || return 0
+-    kill "$pid" 2>/dev/null
+-    while kill -0 "$pid" 2>/dev/null; do
++    # A worker may have made the directory but not yet published its PID.
++    if [ -z "$pid" ]; then
++        sleep 2
++        pid=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
++        [ -d "$DNS_PREFILL_LOCK" ] || return 0
++    fi
++    case "$pid" in ''|*[!0-9]*)
++        log_msg 'ERROR: DNS worker ownership unknown; Apply deferred'; return 1;; esac
++    prefill_process_active "$pid" || return 0
++    prefill_worker_owned "$pid" || {
++            log_msg 'ERROR: DNS worker ownership changed; Apply deferred'; return 1;
++        }
++    if [ -f "$DNS_PREFILL_LOCK/cooperative" ]; then
++        cooperative=1
++        touch "$DNS_PREFILL_LOCK/stop" || return 1
++    else
++        # Upgrade compatibility: do not forcibly kill an old worker whose
++        # foreground query is not tracked by this version.
++        kill "$pid" 2>/dev/null
++    fi
++    while prefill_process_active "$pid"; do
++        # New workers remove their lock only after reaping their query.
++        [ "$cooperative" != 1 ] || [ -d "$DNS_PREFILL_LOCK" ] || return 0
+         [ "$n" -lt 10 ] || { log_msg 'ERROR: DNS worker did not stop; Apply deferred'; return 1; }
+         n=$((n+1)); sleep 1
+     done
++    return 0
+ }
+diff --git a/build-ipk.sh b/build-ipk.sh
+index 97a2245..1dfbb53 100755
+--- a/build-ipk.sh
++++ b/build-ipk.sh
+@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
+ bash tests/run.sh
+ 
+ PKG_NAME="amneziawg"
+-PKG_VERSION="2.2.0-20"
++PKG_VERSION="2.2.0-21"
+ 
+ AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
+ AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
+diff --git a/tests/test_dns_worker.py b/tests/test_dns_worker.py
+new file mode 100644
+index 0000000..5c3bc18
+--- /dev/null
++++ b/tests/test_dns_worker.py
+@@ -0,0 +1,119 @@
++import os
++from pathlib import Path
++import shlex
++import subprocess
++import tempfile
++import time
++import unittest
++
++SOURCE = Path(__file__).resolve().parents[1] / 'addon/awg-runtime.sh'
++
++class DNSWorkerTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.procs = []
++        self.lock = self.root / 'lock'
++        self.pending = self.root / 'pending'
++        self.script = self.root / 'amneziawg.sh'
++        source = SOURCE.read_text().replace('/tmp/.awg_dns_pending', str(self.pending))
++        (self.root / 'runtime.sh').write_text(source)
++        (self.root / 'dns.conf').write_text('ipset=/one.example/two.example/awg_dst\n')
++        self.script.write_text('#!/bin/sh\n' +
++            'DNS_PREFILL_LOCK=' + shlex.quote(str(self.lock)) + '\n' +
++            'DNSMASQ_AWG_CONF=' + shlex.quote(str(self.root / 'dns.conf')) + '\n' +
++            '. ' + shlex.quote(str(self.root / 'runtime.sh')) + '\n' +
++            '''log_msg(){ echo "$*"; }
++update_status(){ :; }
++# Executor host /proc uses different PIDs: mock only process inspection.
++# Child processes, signals, waits and lock handling below remain real.
++prefill_process_active(){ kill -0 "$1" 2>/dev/null; }
++prefill_worker_owned(){ [ "$1" = "$(cat "$DNS_PREFILL_LOCK/test_owner" 2>/dev/null)" ]; }
++"$@"
++''')
++        self.script.chmod(0o755)
++        self.env = dict(os.environ, PATH=str(self.root)+':'+os.environ['PATH'])
++    def tearDown(self):
++        for p in self.procs:
++            if p.poll() is None:
++                p.kill()
++            p.wait()
++        self.tmp.cleanup()
++    def run_cmd(self, *args):
++        return subprocess.run([str(self.script), *args], env=self.env,
++                              capture_output=True, text=True, timeout=15)
++    def start(self, slow=True):
++        query = self.root / 'nslookup'
++        query.write_text('#!/bin/sh\necho $$ > '+shlex.quote(str(self.root/'query.pid'))+'\n' +
++                         ('exec sleep 60\n' if slow else 'exit 0\n'))
++        query.chmod(0o755)
++        self.pending.touch()
++        p = subprocess.Popen([str(self.script), 'prefill_worker'], env=self.env,
++                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        self.procs.append(p)
++        for _ in range(150):
++            if self.lock.exists():
++                (self.lock/'test_owner').write_text(str(p.pid))
++                break
++            time.sleep(.01)
++        return p
++    def await_query(self):
++        for _ in range(150):
++            if (self.root/'query.pid').exists():
++                return int((self.root/'query.pid').read_text())
++            time.sleep(.02)
++        self.fail('Query did not start')
++    def test_cancel_active_query_and_repeat(self):
++        for _ in range(2):
++            (self.root/'query.pid').unlink(missing_ok=True)
++            p = self.start()
++            query = self.await_query()
++            result = self.run_cmd('cancel_prefill')
++            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
++            self.assertEqual(p.wait(timeout=3), 0)
++            with self.assertRaises(ProcessLookupError):
++                os.kill(query, 0)
++            self.assertFalse(self.lock.exists())
++            self.assertFalse(self.pending.exists())
++    def test_normal_completion(self):
++        p = self.start(False)
++        self.assertEqual(p.wait(timeout=5), 0)
++        self.assertFalse(self.lock.exists())
++    def test_query_timeout(self):
++        p = self.start()
++        query = self.await_query()
++        # Cancel subsequent domains; a single query must be bounded as well.
++        (self.root/'dns.conf').write_text('ipset=/one.example/awg_dst\n')
++        # Existing snapshot has two domains, so allow both bounded timeouts.
++        self.assertEqual(p.wait(timeout=22), 0)
++        with self.assertRaises(ProcessLookupError):
++            os.kill(query, 0)
++        self.assertFalse(self.lock.exists())
++    def test_unrelated_owner_not_signalled(self):
++        p = subprocess.Popen(['sleep', '60'])
++        self.procs.append(p)
++        self.lock.mkdir()
++        (self.lock/'pid').write_text(str(p.pid))
++        result = self.run_cmd('cancel_prefill')
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIsNone(p.poll())
++    def test_proc_state_and_identity(self):
++        root = self.root/'proc'
++        proc = root/'123'
++        proc.mkdir(parents=True)
++        runtime = self.root/'parser.sh'
++        runtime.write_text(SOURCE.read_text().replace('/proc/', str(root)+'/'))
++        def check(function):
++            return subprocess.run(['/bin/sh', '-c', '. "$1"; "$2" 123',
++                                   'test', str(runtime), function]).returncode
++        (proc/'stat').write_text('123 (name with ) spaces) Z 1 2 3\n')
++        self.assertNotEqual(check('prefill_process_active'), 0)
++        (proc/'stat').write_text('123 (amneziawg.sh) S 1 2 3\n')
++        self.assertEqual(check('prefill_process_active'), 0)
++        (proc/'cmdline').write_bytes(b'/bin/sh\x00/jffs/addons/amneziawg/amneziawg.sh\x00prefill_worker\x00')
++        self.assertEqual(check('prefill_worker_owned'), 0)
++        (proc/'cmdline').write_bytes(b'sleep\x0060\x00')
++        self.assertNotEqual(check('prefill_worker_owned'), 0)
++    def test_idle_worker_does_not_create_lock(self):
++        self.assertEqual(self.run_cmd('prefill_worker').returncode, 0)
++        self.assertFalse(self.lock.exists())
