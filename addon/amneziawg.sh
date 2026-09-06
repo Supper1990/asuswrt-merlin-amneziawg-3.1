@@ -18,6 +18,7 @@ GEO_DIR="$AWG_DIR/geo"
 IPSET_NAME="awg_dst"
 IPSET_MIN_COUNT_FILE="/tmp/.awg_ipset_min_count"
 FIREWALL_EXPECTED="/tmp/.awg_firewall_expected"
+FIREWALL_PENDING="/tmp/.awg_firewall_pending"
 FWMARK="0x100"
 DIRECT_MARK="0x101"
 DNSMASQ_AWG_CONF="$AWG_DIR/dnsmasq_awg.conf"
@@ -1608,6 +1609,39 @@ tunnel_healthy(){
 
 . "${AWG_RUNTIME_PATH:-$ADDON_DIR/awg-runtime.sh}" || exit 1
 
+queue_firewall_restart(){
+    : > "$FIREWALL_PENDING"
+    log_msg "Firewall restart deferred: addon busy"
+}
+
+replay_pending_firewall(){
+    [ -f "$FIREWALL_PENDING" ] || return 0
+
+    rm -f "$FIREWALL_PENDING"
+
+    if ! is_running; then
+        log_msg "Deferred firewall restart skipped: tunnel not running"
+        return 0
+    fi
+
+    log_msg "Replaying deferred firewall restart"
+
+    if ! do_firewall_restart; then
+        : > "$FIREWALL_PENDING"
+        log_msg "ERROR: deferred firewall restart failed; watchdog will retry"
+        return 1
+    fi
+
+    if ! main_firewall_healthy; then
+        : > "$FIREWALL_PENDING"
+        log_msg "ERROR: deferred firewall restart incomplete; watchdog will retry"
+        return 1
+    fi
+
+    log_msg "Deferred firewall restart completed"
+    return 0
+}
+
 # --- Main ---
 
 # Serialize runtime changes. Package upgrades manage stop/install separately
@@ -1619,6 +1653,13 @@ if [ "$1" = "service_event" ]; then
     case "$operation_id" in ''|*[!0-9]*) operation_id=0;; esac
     [ "$operation_id" = 0 ] || operation_write "$operation_id" running "$operation"
 fi
+# firewall-start must never be lost while another addon operation owns the
+# dispatcher lock. Remember the event and replay it after that operation.
+if [ "$operation" = "firewall_restart" ] && [ -d "$LOCKDIR" ]; then
+    queue_firewall_restart
+    exit 0
+fi
+
 case "$operation" in
     mount_ui|status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
     *)
@@ -1663,8 +1704,26 @@ case "$1" in
 esac
 
 operation_result=$?
+
 if [ -n "${operation_id:-}" ] && [ "$operation_id" != 0 ]; then
-    if [ "$operation_result" = 0 ]; then operation_write "$operation_id" succeeded "$operation";
-    else operation_write "$operation_id" failed "Operation failed; see log"; fi
+    if [ "$operation_result" = 0 ]; then
+        operation_write "$operation_id" succeeded "$operation"
+    else
+        operation_write "$operation_id" failed "Operation failed; see log"
+    fi
 fi
+
+# Release the dispatcher lock explicitly, then immediately replay a
+# firewall-start event that arrived while the addon was busy.
+if [ "${DISPATCH_LOCK:-0}" = "1" ]; then
+    trap - 0
+    rm -rf "$LOCKDIR"
+    DISPATCH_LOCK=0
+
+    if [ "$operation" != "firewall_restart" ] &&
+       [ -f "$FIREWALL_PENDING" ]; then
+        replay_pending_firewall || true
+    fi
+fi
+
 exit "$operation_result"
