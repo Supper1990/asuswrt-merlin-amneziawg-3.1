@@ -177,10 +177,12 @@ pre_resolve_domains_async(){
 }
 
 prefill_worker(){
-    local old domain n=0 ok=0 failed=0 domains
+    local old domain n=0 ok=0 failed=0 domains poll_delay=1 poll_limit=8
+    DNS_QUERY_PID=""
+    [ -f /tmp/.awg_dns_pending ] || return 0
     if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
         old=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
-        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then return 0; fi
+        if [ -n "$old" ] && prefill_process_active "$old"; then return 0; fi
         # Empty lock may be in the process of being initialized.
         if [ -z "$old" ]; then
             sleep 2
@@ -191,9 +193,12 @@ prefill_worker(){
         mkdir "$DNS_PREFILL_LOCK" || return 1
     fi
     echo $$ > "$DNS_PREFILL_LOCK/pid"
-    trap 'rm -rf "$DNS_PREFILL_LOCK"' 0
+    touch "$DNS_PREFILL_LOCK/cooperative"
+    trap 'prefill_cleanup' 0
     trap 'exit 1' 1 2 15
-    while [ -f /tmp/.awg_dns_pending ]; do
+    # Probe fractional sleep instead of assuming every Merlin build supports it.
+    if sleep 0.1 2>/dev/null; then poll_delay=0.1; poll_limit=80; fi
+    while [ -f /tmp/.awg_dns_pending ] && [ ! -f "$DNS_PREFILL_LOCK/stop" ]; do
         rm -f /tmp/.awg_dns_pending
         [ -s "$DNSMASQ_AWG_CONF" ] || continue
         domains="$DNS_PREFILL_LOCK/domains"
@@ -202,7 +207,25 @@ prefill_worker(){
         log_msg 'Domain pre-resolution started'
         while IFS= read -r domain; do
             [ -n "$domain" ] || continue
-            if timeout 8 nslookup "$domain" 127.0.0.1 >/dev/null 2>&1; then ok=$((ok+1)); else failed=$((failed+1)); fi
+            [ ! -f "$DNS_PREFILL_LOCK/stop" ] || return 0
+            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
+            DNS_QUERY_PID=$!
+            n=0
+            while prefill_process_active "$DNS_QUERY_PID"; do
+                [ ! -f "$DNS_PREFILL_LOCK/stop" ] || return 0
+                [ "$n" -lt "$poll_limit" ] || break
+                n=$((n+1)); sleep "$poll_delay"
+            done
+            if prefill_process_active "$DNS_QUERY_PID"; then
+                kill -9 "$DNS_QUERY_PID" 2>/dev/null
+                wait "$DNS_QUERY_PID" 2>/dev/null
+                failed=$((failed+1))
+            elif wait "$DNS_QUERY_PID" 2>/dev/null; then
+                ok=$((ok+1))
+            else
+                failed=$((failed+1))
+            fi
+            DNS_QUERY_PID=""
         done < "$domains"
         log_msg "Domain pre-resolution finished: success=$ok failed=$failed"
         update_status
@@ -436,17 +459,61 @@ restore_owned_rules(){
     rm -f "$rules"
 }
 
+# A zombie cannot issue DNS queries; kill -0 alone also reports zombies alive.
+prefill_process_active(){
+    local info
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    info=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    info=${info##*) }
+    case "$info" in Z\ *|X\ *) return 1;; esac
+    return 0
+}
+
+prefill_cleanup(){
+    # DNS_QUERY_PID is our own unreaped child, never a PID loaded from a stale file.
+    if [ -n "$DNS_QUERY_PID" ]; then
+        kill -9 "$DNS_QUERY_PID" 2>/dev/null
+        wait "$DNS_QUERY_PID" 2>/dev/null
+        DNS_QUERY_PID=""
+    fi
+    [ "$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)" != "$$" ] || rm -rf "$DNS_PREFILL_LOCK"
+}
+
+prefill_worker_owned(){
+    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null |
+        grep -q 'amneziawg.sh prefill_worker'
+}
+
 cancel_prefill(){
-    local pid n=0
+    local pid n=0 cooperative=0
     rm -f /tmp/.awg_dns_pending
+    [ -d "$DNS_PREFILL_LOCK" ] || return 0
     pid=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
-    case "$pid" in ''|*[!0-9]*) return 0;; esac
-    kill -0 "$pid" 2>/dev/null || return 0
-    # Verify ownership before signalling a PID retained across an interrupted run.
-    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'amneziawg.sh prefill_worker' || return 0
-    kill "$pid" 2>/dev/null
-    while kill -0 "$pid" 2>/dev/null; do
+    # A worker may have made the directory but not yet published its PID.
+    if [ -z "$pid" ]; then
+        sleep 2
+        pid=$(cat "$DNS_PREFILL_LOCK/pid" 2>/dev/null)
+        [ -d "$DNS_PREFILL_LOCK" ] || return 0
+    fi
+    case "$pid" in ''|*[!0-9]*)
+        log_msg 'ERROR: DNS worker ownership unknown; Apply deferred'; return 1;; esac
+    prefill_process_active "$pid" || return 0
+    prefill_worker_owned "$pid" || {
+            log_msg 'ERROR: DNS worker ownership changed; Apply deferred'; return 1;
+        }
+    if [ -f "$DNS_PREFILL_LOCK/cooperative" ]; then
+        cooperative=1
+        touch "$DNS_PREFILL_LOCK/stop" || return 1
+    else
+        # Upgrade compatibility: do not forcibly kill an old worker whose
+        # foreground query is not tracked by this version.
+        kill "$pid" 2>/dev/null
+    fi
+    while prefill_process_active "$pid"; do
+        # New workers remove their lock only after reaping their query.
+        [ "$cooperative" != 1 ] || [ -d "$DNS_PREFILL_LOCK" ] || return 0
         [ "$n" -lt 10 ] || { log_msg 'ERROR: DNS worker did not stop; Apply deferred'; return 1; }
         n=$((n+1)); sleep 1
     done
+    return 0
 }

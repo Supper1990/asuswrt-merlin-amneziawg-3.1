@@ -295,3 +295,9 @@ Page registration has a separate lock and no longer starts the tunnel. S99 launc
 UI readiness is retried up to 12 times with 5-second gaps. The independent `awg_ui_watchdog` cron checks the page and menu once per minute, even when the tunnel is stopped, and is removed on uninstall. Missing menu anchors preserve the current menu; healthy pages are not deleted or rebound.
 
 Validation: 40 test methods, including 7 simulated UI recovery tests. Real Merlin boot and coexistence with other addons still require router verification. The user confirmed manual page restoration, but the original boot failure was not proven to be a lock collision; this release removes that observed code-level risk.
+
+### DNS prefill cancellation during Apply: 2.2.0-21
+
+Apply requests cooperative DNS-worker cancellation. The worker checks the request while waiting for DNS, terminates its own child `nslookup`, and releases its lock after `wait`. Each query has an eight-second sleep budget: 80 intervals of 0.1 seconds, or eight one-second intervals when fractional sleep is unavailable. Apply remains deferred when cancellation cannot be confirmed. Zombie processes are not considered active. During upgrades, a legacy worker retains the previous cancellation path until a new worker is started.
+
+Tests cover active-query cancellation, repeated execution, completion, query timeout, unrelated PIDs, process-state parsing and idle startup. Process tests mock `/proc` inspection; Apply still requires verification on the router.
