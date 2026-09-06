@@ -1,0 +1,360 @@
+diff --git a/README.md b/README.md
+index d7b1e3a..a562d4e 100644
+--- a/README.md
++++ b/README.md
+@@ -287,3 +287,11 @@ MIT License
+ ### Исправление запуска 2.2.0-19
+ 
+ На роутере при старте 2.2.0-18 зафиксировано `command: not found` из обёртки firewall. Теперь `ip` и `iptables` предварительно находятся в PATH и запускаются по абсолютному пути. Проверка обязательных ошибок сохранена; добавлены сообщения о сбое команды и тесты оболочки без `command`.
++
++### Восстановление вкладки после загрузки: 2.2.0-20
++
++Регистрация вкладки отделена от запуска туннеля и использует свою блокировку. `mount_ui` не запускает AmneziaWG. Сценарий S99 параллельно запускает восстановление страницы, затем выполняет `boot_start` с учётом настройки автозапуска. Существующий `services-start` также может вызывать `mount_ui`: повторный вызов переиспользует страницу.
++
++При поздней готовности веб-интерфейса выполняются до 12 попыток с паузой 5 секунд. Задание `awg_ui_watchdog` раз в минуту проверяет страницу и запись меню, в том числе при остановленном туннеле. Оно удаляется при удалении аддона. Рабочая страница не удаляется перед регистрацией новой; отсутствие ожидаемого пункта меню вызывает ошибку без перезаписи текущего меню.
++
++Проверки: 40 тестовых методов в `bash tests/run.sh`, включая 7 проверок UI с имитацией файлов и mount. Реальную загрузку Merlin и взаимодействие с другими аддонами нужно проверить после установки. Ручное восстановление вкладки на роутере подтверждено пользователем, но причина первоначального сбоя по журналу не установлена; конкуренция запуска и регистрации — обнаруженный в коде риск, устранённый этой версией.
+diff --git a/README_EN.md b/README_EN.md
+index 9507fef..552f0b0 100644
+--- a/README_EN.md
++++ b/README_EN.md
+@@ -287,3 +287,11 @@ See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitation
+ ### Startup fix in 2.2.0-19
+ 
+ A router running 2.2.0-18 reported `command: not found` from the firewall wrapper. The addon now resolves external `ip` and `iptables` executables from PATH before wrapping them and invokes their absolute paths. Required-operation failure checks remain active; command failure messages and regression tests without `command` are included.
++
++### Web UI boot recovery: 2.2.0-20
++
++Page registration has a separate lock and no longer starts the tunnel. S99 launches page recovery in the background before calling `boot_start`, which respects the autostart setting. Repeated `mount_ui` calls reuse the existing page.
++
++UI readiness is retried up to 12 times with 5-second gaps. The independent `awg_ui_watchdog` cron checks the page and menu once per minute, even when the tunnel is stopped, and is removed on uninstall. Missing menu anchors preserve the current menu; healthy pages are not deleted or rebound.
++
++Validation: 40 test methods, including 7 simulated UI recovery tests. Real Merlin boot and coexistence with other addons still require router verification. The user confirmed manual page restoration, but the original boot failure was not proven to be a lock collision; this release removes that observed code-level risk.
+diff --git a/addon/amneziawg.sh b/addon/amneziawg.sh
+index abab9db..0d75438 100755
+--- a/addon/amneziawg.sh
++++ b/addon/amneziawg.sh
+@@ -26,6 +26,11 @@ DNS_PREFILL_LOCK="/tmp/.awg_dns_prefill"
+ SCRIPT_NAME="amneziawg"
+ RT_TABLE=300
+ AWG_CHAIN="AWG"
++UI_WEB_DIR="/www/user"
++UI_MENU_FILE="/www/require/modules/menuTree.js"
++UI_MENU_CACHE="/tmp/menuTree.js"
++UI_HELPER="/usr/sbin/helper.sh"
++UI_LOCKDIR="/tmp/.awg_ui_lock"
+ LOCKDIR="/tmp/.awg_lock"
+ AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
+ UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
+@@ -498,12 +503,66 @@ download_all_geo(){
+ 
+ # Mount AmneziaWG tab into Merlin menu
+ mount_menu_tree(){
+-    local page="$1"
+-    [ ! -f /tmp/menuTree.js ] && cp /www/require/modules/menuTree.js /tmp/
+-    sed -i '/AmneziaWG/d' /tmp/menuTree.js
+-    sed -i "/url: \"Advanced_VPN_OpenVPN.asp\"/a {url: \"$page\", tabName: \"AmneziaWG\"}," /tmp/menuTree.js
+-    umount /www/require/modules/menuTree.js 2>/dev/null
+-    mount -o bind /tmp/menuTree.js /www/require/modules/menuTree.js
++    local page="$1" candidate previous
++    candidate=$(mktemp /tmp/awg_menu_new.XXXXXX) || return 1
++    previous=$(mktemp /tmp/awg_menu_old.XXXXXX) || { rm -f "$candidate"; return 1; }
++    cp "$UI_MENU_FILE" "$previous" || { rm -f "$candidate" "$previous"; return 1; }
++    # Start from the visible menu, retaining entries installed by other addons.
++    if ! awk -v page="$page" '
++        /tabName: "AmneziaWG"/{next}
++        {print}
++        !added && /url: "Advanced_VPN_OpenVPN.asp"/ {
++            print "{url: \"" page "\", tabName: \"AmneziaWG\"},"; added=1
++        }
++        END{if(!added)exit 1}' "$previous" > "$candidate"; then
++        log_msg 'ERROR: UI menu anchor not ready; current menu retained'
++        rm -f "$candidate" "$previous"; return 1
++    fi
++    cp "$candidate" "$UI_MENU_CACHE" || { rm -f "$candidate" "$previous"; return 1; }
++    umount "$UI_MENU_FILE" 2>/dev/null
++    if ! mount -o bind "$UI_MENU_CACHE" "$UI_MENU_FILE"; then
++        log_msg 'ERROR: UI menu bind mount failed; restoring previous menu'
++        cp "$previous" "$UI_MENU_CACHE" && mount -o bind "$UI_MENU_CACHE" "$UI_MENU_FILE"
++        rm -f "$candidate" "$previous"; return 1
++    fi
++    rm -f "$candidate" "$previous"
++}
++
++ui_ready(){
++    [ -r "$UI_HELPER" ] && [ -s "$ADDON_DIR/amneziawg_page.asp" ] &&
++        [ -d "$UI_WEB_DIR" ] && [ -w "$UI_WEB_DIR" ] && [ -s "$UI_MENU_FILE" ]
++}
++
++ui_mount_once(){
++    local f page="" changed=0 pending
++    ui_ready || return 1
++    . "$UI_HELPER" || return 1
++    # Reuse our slot. Never delete the working page to ask for a new slot.
++    for f in "$UI_WEB_DIR"/user*.asp; do
++        [ -f "$f" ] || continue
++        if grep -qF '<title>AmneziaWG</title>' "$f"; then page=${f##*/}; break; fi
++    done
++    if [ -z "$page" ]; then
++        am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
++        # Merlin communicates the selected slot through am_webui_page.
++        page="$am_webui_page"
++    fi
++    printf '%s\n' "$page" | grep -qE '^user[0-9]+[.]asp$' || {
++        log_msg 'ERROR: no valid Web UI slot available'; return 1;
++    }
++    if ! cmp -s "$ADDON_DIR/amneziawg_page.asp" "$UI_WEB_DIR/$page"; then
++        pending="$UI_WEB_DIR/.awg_page.$$"
++        cp "$ADDON_DIR/amneziawg_page.asp" "$pending" &&
++            mv "$pending" "$UI_WEB_DIR/$page" || { rm -f "$pending"; return 1; }
++        changed=1
++    fi
++    if ! grep -F "url: \"$page\"" "$UI_MENU_FILE" | grep -qF 'tabName: "AmneziaWG"'; then
++        mount_menu_tree "$page" || return 1
++        changed=1
++    fi
++    grep -F "url: \"$page\"" "$UI_MENU_FILE" | grep -qF 'tabName: "AmneziaWG"' || return 1
++    [ "$changed" = 0 ] || log_msg "Web UI restored: $page"
++    return 0
+ }
+ 
+ # Bulk-load CIDR file into ipset using restore (much faster than individual adds)
+@@ -1289,7 +1348,6 @@ do_stop(){
+ # --- Install/Mount/Uninstall ---
+ 
+ do_install_page(){
+-    source /usr/sbin/helper.sh
+     nvram get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
+ 
+     mkdir -p "$ADDON_DIR"
+@@ -1301,19 +1359,6 @@ do_install_page(){
+ 
+     [ -f "/tmp/amneziawg_page.asp" ] && cp /tmp/amneziawg_page.asp "$ADDON_DIR/amneziawg_page.asp"
+ 
+-    # Clean old page slots before requesting a new one
+-    for f in /www/user/user*.asp; do
+-        grep -q "AmneziaWG" "$f" 2>/dev/null && rm -f "$f"
+-    done
+-
+-    am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
+-    [ "$am_webui_page" = "none" ] && { log_msg "ERROR: No page slot"; return 1; }
+-
+-    cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$am_webui_page"
+-    mount_menu_tree "$am_webui_page"
+-
+-    echo '{"running":false,"peers":[],"log":"Installed."}' > "$STATUS_FILE"
+-
+     [ ! -f /jffs/scripts/service-event ] && echo "#!/bin/sh" > /jffs/scripts/service-event && chmod +x /jffs/scripts/service-event
+     if ! grep -q "amneziawg" /jffs/scripts/service-event; then
+         echo 'echo "$2" | grep -q "^awg" && /jffs/addons/amneziawg/amneziawg.sh "service_event" "$1" "$2"' >> /jffs/scripts/service-event
+@@ -1343,33 +1388,40 @@ do_install_page(){
+ 
+     ensure_status_loop
+     update_status
+-    log_msg "Page installed: $am_webui_page"
++    do_mount_ui || return 1
++    log_msg "Page installation complete"
+     echo "Installed. Access: VPN > AmneziaWG"
+ }
+ 
+ do_mount_ui(){
+-    source /usr/sbin/helper.sh
+-    # Clean old slots
+-    for f in /www/user/user*.asp; do
+-        grep -q "AmneziaWG" "$f" 2>/dev/null && rm -f "$f"
+-    done
+-    am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
+-    if [ "$am_webui_page" != "none" ]; then
+-        cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$am_webui_page"
+-        mount_menu_tree "$am_webui_page"
+-    fi
+-
+-    [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
+-    ensure_status_loop
+-    update_status
+-
+-    if autostart_enabled; then
+-        sleep 10
+-        do_start
+-    fi
++    (
++        # UI work must not wait behind tunnel setup or rebuilding AntiFilter.
++        # This cron also operates when the tunnel is deliberately stopped.
++        [ -s "$ADDON_DIR/amneziawg_page.asp" ] || exit 1
++        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then exit 1; fi
++        cru a awg_ui_watchdog "* * * * * '$ADDON_DIR/amneziawg.sh' mount_ui" || exit 1
++        LOCKDIR="$UI_LOCKDIR"
++        DISPATCH_LOCK=0
++        acquire_lock || exit 1
++        trap 'release_lock' 0
++        trap 'exit 1' 1 2 15
++        local attempt=0
++        while [ "$attempt" -lt 12 ]; do
++            if ui_mount_once; then
++                [ ! -f "$GEO_DIR/v2fly_categories.txt" ] || cp "$GEO_DIR/v2fly_categories.txt" "$UI_WEB_DIR/v2fly_categories.htm"
++                ensure_status_loop
++                exit 0
++            fi
++            attempt=$((attempt+1))
++            [ "$attempt" -ge 12 ] || sleep 5
++        done
++        log_msg 'ERROR: Web UI not ready; UI watchdog will retry'
++        exit 1
++    )
+ }
+ 
+ do_uninstall(){
++    cru d awg_ui_watchdog 2>/dev/null
+     do_stop
+ 
+     [ -x "$AUX_IPSET_SCRIPT" ] && "$AUX_IPSET_SCRIPT" --cleanup 2>/dev/null
+@@ -1568,7 +1620,7 @@ if [ "$1" = "service_event" ]; then
+     [ "$operation_id" = 0 ] || operation_write "$operation_id" running "$operation"
+ fi
+ case "$operation" in
+-    status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
++    mount_ui|status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
+     *)
+         if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
+             log_msg 'ERROR: package update in progress'
+diff --git a/build-ipk.sh b/build-ipk.sh
+index cee5467..97a2245 100755
+--- a/build-ipk.sh
++++ b/build-ipk.sh
+@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
+ bash tests/run.sh
+ 
+ PKG_NAME="amneziawg"
+-PKG_VERSION="2.2.0-19"
++PKG_VERSION="2.2.0-20"
+ 
+ AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
+ AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
+@@ -154,6 +154,7 @@ PRERMEOF
+ 
+ case "$1" in
+     start)
++        /jffs/addons/amneziawg/amneziawg.sh mount_ui </dev/null >/tmp/awg-ui-boot.log 2>&1 &
+         /jffs/addons/amneziawg/amneziawg.sh boot_start
+         ;;
+     stop)
+diff --git a/tests/test_ui_boot.py b/tests/test_ui_boot.py
+new file mode 100644
+index 0000000..cdae893
+--- /dev/null
++++ b/tests/test_ui_boot.py
+@@ -0,0 +1,114 @@
++"""Web UI recovery without router mounts, daemon startup or network access."""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++from test_recovery import functions, ROOT
++MAIN=(ROOT/'addon/amneziawg.sh').read_text()
++UI_FUNCTIONS=functions(MAIN,'mount_menu_tree','ui_ready','ui_mount_once','do_mount_ui','acquire_lock','release_lock')
++
++class UIBoot(unittest.TestCase):
++    def fixture(self, d):
++        root=Path(d)
++        for name in ('addon','web','geo','main-lock'):(root/name).mkdir()
++        (root/'main-lock/pid').write_text(str(os.getpid()))
++        (root/'addon/amneziawg_page.asp').write_text('<title>AmneziaWG</title>\nnew page\n')
++        (root/'menu').write_text('{url: "Advanced_VPN_OpenVPN.asp", tabName: "OpenVPN"},\n{url: "other.asp", tabName: "Other addon"},\n')
++        (root/'helper').write_text('am_get_webui_page(){ am_webui_page=user3.asp; return 1; }\n')
++        return dict(ADDON_DIR=d+'/addon',UI_WEB_DIR=d+'/web',GEO_DIR=d+'/geo',UI_MENU_FILE=d+'/menu',
++                    UI_MENU_CACHE=d+'/cache',UI_HELPER=d+'/helper',UI_LOCKDIR=d+'/ui-lock',LOCKDIR=d+'/main-lock',
++                    TRACE=d+'/trace',D=d,DISPATCH_LOCK='1')
++
++    def shell(self, body, env):
++        stubs='''
++package_busy(){ return 1; }
++log_msg(){ printf '%s\\n' "$*" >> "$TRACE"; }
++cru(){ printf 'cron %s\\n' "$*" >> "$TRACE"; }
++ensure_status_loop(){ :; }
++do_start(){ echo UNEXPECTED_START >> "$TRACE"; return 1; }
++umount(){ :; }
++mount(){ printf 'mount\\n' >> "$TRACE"; cp "$3" "$4"; }
++'''
++        return subprocess.run(['/bin/sh'],input=UI_FUNCTIONS+stubs+body,env=dict(os.environ,**env),
++                              text=True,capture_output=True,timeout=10)
++
++    def test_mount_does_not_wait_for_main_lock_or_start_tunnel(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            result=self.shell('\ndo_mount_ui\n',env)
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertTrue(Path(d,'web/user3.asp').exists())
++            self.assertEqual(Path(d,'main-lock/pid').read_text(),str(os.getpid()))
++            self.assertFalse(Path(d,'ui-lock').exists())
++            trace=Path(d,'trace').read_text()
++            self.assertNotIn('UNEXPECTED_START',trace)
++            self.assertIn('awg_ui_watchdog',trace)
++            self.assertIn('Other addon',Path(d,'menu').read_text())
++
++    def test_repeated_mount_reuses_page_and_does_not_rebind(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            result=self.shell('\ndo_mount_ui && do_mount_ui\n',env)
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertEqual(len(list(Path(d,'web').glob('user*.asp'))),1)
++            self.assertEqual(Path(d,'menu').read_text().count('tabName: "AmneziaWG"'),1)
++            self.assertEqual(Path(d,'trace').read_text().splitlines().count('mount'),1)
++
++    def test_late_httpd_readiness_is_retried(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            Path(d,'menu').rename(Path(d,'menu-later'))
++            result=self.shell('''
++sleep(){ cp "$D/menu-later" "$UI_MENU_FILE"; }
++do_mount_ui
++''',env)
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertTrue(Path(d,'web/user3.asp').exists())
++
++    def test_menu_reset_is_repaired_without_replacing_page(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            result=self.shell('''
++do_mount_ui || exit 1
++printf '{url: "Advanced_VPN_OpenVPN.asp", tabName: "OpenVPN"},\\n' > "$UI_MENU_FILE"
++do_mount_ui
++''',env)
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertIn('tabName: "AmneziaWG"',Path(d,'menu').read_text())
++            self.assertEqual(Path(d,'trace').read_text().splitlines().count('mount'),2)
++
++    def test_missing_anchor_preserves_existing_menu_and_page(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            Path(d,'menu').write_text('Other addon menu without expected anchor\n')
++            Path(d,'web/user3.asp').write_bytes(Path(d,'addon/amneziawg_page.asp').read_bytes())
++            result=self.shell('sleep(){ :; }\ndo_mount_ui\n',env)
++            self.assertEqual(result.returncode,1,result.stderr)
++            self.assertEqual(Path(d,'menu').read_text(),'Other addon menu without expected anchor\n')
++            self.assertTrue(Path(d,'web/user3.asp').exists())
++            self.assertNotIn('mount\n',Path(d,'trace').read_text())
++            self.assertIn('UI watchdog will retry',Path(d,'trace').read_text())
++
++    def test_failed_bind_restores_previous_menu(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d);old=Path(d,'menu').read_text()
++            result=self.shell('''
++mount(){
++    if [ ! -f "$D/failed" ]; then touch "$D/failed"; return 1; fi
++    cp "$3" "$4"
++}
++ui_mount_once
++''',env)
++            self.assertEqual(result.returncode,1,result.stderr)
++            self.assertEqual(Path(d,'menu').read_text(),old)
++
++    def test_stale_ui_lock_recovered(self):
++        with tempfile.TemporaryDirectory() as d:
++            env=self.fixture(d)
++            Path(d,'ui-lock').mkdir();Path(d,'ui-lock/pid').write_text('2147483647')
++            result=self.shell('\ndo_mount_ui\n',env)
++            self.assertEqual(result.returncode,0,result.stderr)
++            self.assertFalse(Path(d,'ui-lock').exists())
++
++if __name__=='__main__':unittest.main()
