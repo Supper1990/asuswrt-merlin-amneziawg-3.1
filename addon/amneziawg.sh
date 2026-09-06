@@ -739,7 +739,7 @@ setup_firewall_body(){
     fi
 
     if [ -s "$GEO_DIR/domains/warnings.txt" ]; then
-        log_msg "WARNING: GeoSite conversion limitations: $(wc -l < "$GEO_DIR/domains/warnings.txt") rules; details: $GEO_DIR/domains/warnings.txt"
+        log_msg "WARNING: GeoSite conversion limitations: $(wc -l < "$GEO_DIR/domains/warnings.txt") rules; details: $original_geo/domains/warnings.txt"
     fi
 
     # --- Save custom domains/IPs ---
