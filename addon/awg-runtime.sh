@@ -159,6 +159,7 @@ setup_firewall(){
     fi
     prune_unselected_geoip_lists "$(selected_geoip_services)"
     rm -f "$original_geo/domains/v2fly_"*.txt "$original_geo/domains/custom.txt"
+    mkdir -p "$original_geo" || { log_msg 'ERROR: cannot create geo cache directory'; rm -rf "$txn"; return 1; }
     cp -a "$txn/geo/." "$original_geo/" || { log_msg 'ERROR: cannot commit geo cache'; rm -rf "$txn"; return 1; }
     rm -rf "$txn"
     # Store exact static members, rather than a floor that hides partial loss.
