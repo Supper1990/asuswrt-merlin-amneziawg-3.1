@@ -287,3 +287,11 @@ See [docs/AUDIT-18.md](docs/AUDIT-18.md) for validation, GeoSite/IPv6 limitation
 ### Startup fix in 2.2.0-19
 
 A router running 2.2.0-18 reported `command: not found` from the firewall wrapper. The addon now resolves external `ip` and `iptables` executables from PATH before wrapping them and invokes their absolute paths. Required-operation failure checks remain active; command failure messages and regression tests without `command` are included.
+
+### Web UI boot recovery: 2.2.0-20
+
+Page registration has a separate lock and no longer starts the tunnel. S99 launches page recovery in the background before calling `boot_start`, which respects the autostart setting. Repeated `mount_ui` calls reuse the existing page.
+
+UI readiness is retried up to 12 times with 5-second gaps. The independent `awg_ui_watchdog` cron checks the page and menu once per minute, even when the tunnel is stopped, and is removed on uninstall. Missing menu anchors preserve the current menu; healthy pages are not deleted or rebound.
+
+Validation: 40 test methods, including 7 simulated UI recovery tests. Real Merlin boot and coexistence with other addons still require router verification. The user confirmed manual page restoration, but the original boot failure was not proven to be a lock collision; this release removes that observed code-level risk.

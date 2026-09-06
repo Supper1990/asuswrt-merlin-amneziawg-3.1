@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 bash tests/run.sh
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-19"
+PKG_VERSION="2.2.0-20"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
@@ -154,6 +154,7 @@ PRERMEOF
 
 case "$1" in
     start)
+        /jffs/addons/amneziawg/amneziawg.sh mount_ui </dev/null >/tmp/awg-ui-boot.log 2>&1 &
         /jffs/addons/amneziawg/amneziawg.sh boot_start
         ;;
     stop)

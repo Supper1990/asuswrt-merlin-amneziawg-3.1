@@ -26,6 +26,11 @@ DNS_PREFILL_LOCK="/tmp/.awg_dns_prefill"
 SCRIPT_NAME="amneziawg"
 RT_TABLE=300
 AWG_CHAIN="AWG"
+UI_WEB_DIR="/www/user"
+UI_MENU_FILE="/www/require/modules/menuTree.js"
+UI_MENU_CACHE="/tmp/menuTree.js"
+UI_HELPER="/usr/sbin/helper.sh"
+UI_LOCKDIR="/tmp/.awg_ui_lock"
 LOCKDIR="/tmp/.awg_lock"
 AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
 UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
@@ -498,12 +503,66 @@ download_all_geo(){
 
 # Mount AmneziaWG tab into Merlin menu
 mount_menu_tree(){
-    local page="$1"
-    [ ! -f /tmp/menuTree.js ] && cp /www/require/modules/menuTree.js /tmp/
-    sed -i '/AmneziaWG/d' /tmp/menuTree.js
-    sed -i "/url: \"Advanced_VPN_OpenVPN.asp\"/a {url: \"$page\", tabName: \"AmneziaWG\"}," /tmp/menuTree.js
-    umount /www/require/modules/menuTree.js 2>/dev/null
-    mount -o bind /tmp/menuTree.js /www/require/modules/menuTree.js
+    local page="$1" candidate previous
+    candidate=$(mktemp /tmp/awg_menu_new.XXXXXX) || return 1
+    previous=$(mktemp /tmp/awg_menu_old.XXXXXX) || { rm -f "$candidate"; return 1; }
+    cp "$UI_MENU_FILE" "$previous" || { rm -f "$candidate" "$previous"; return 1; }
+    # Start from the visible menu, retaining entries installed by other addons.
+    if ! awk -v page="$page" '
+        /tabName: "AmneziaWG"/{next}
+        {print}
+        !added && /url: "Advanced_VPN_OpenVPN.asp"/ {
+            print "{url: \"" page "\", tabName: \"AmneziaWG\"},"; added=1
+        }
+        END{if(!added)exit 1}' "$previous" > "$candidate"; then
+        log_msg 'ERROR: UI menu anchor not ready; current menu retained'
+        rm -f "$candidate" "$previous"; return 1
+    fi
+    cp "$candidate" "$UI_MENU_CACHE" || { rm -f "$candidate" "$previous"; return 1; }
+    umount "$UI_MENU_FILE" 2>/dev/null
+    if ! mount -o bind "$UI_MENU_CACHE" "$UI_MENU_FILE"; then
+        log_msg 'ERROR: UI menu bind mount failed; restoring previous menu'
+        cp "$previous" "$UI_MENU_CACHE" && mount -o bind "$UI_MENU_CACHE" "$UI_MENU_FILE"
+        rm -f "$candidate" "$previous"; return 1
+    fi
+    rm -f "$candidate" "$previous"
+}
+
+ui_ready(){
+    [ -r "$UI_HELPER" ] && [ -s "$ADDON_DIR/amneziawg_page.asp" ] &&
+        [ -d "$UI_WEB_DIR" ] && [ -w "$UI_WEB_DIR" ] && [ -s "$UI_MENU_FILE" ]
+}
+
+ui_mount_once(){
+    local f page="" changed=0 pending
+    ui_ready || return 1
+    . "$UI_HELPER" || return 1
+    # Reuse our slot. Never delete the working page to ask for a new slot.
+    for f in "$UI_WEB_DIR"/user*.asp; do
+        [ -f "$f" ] || continue
+        if grep -qF '<title>AmneziaWG</title>' "$f"; then page=${f##*/}; break; fi
+    done
+    if [ -z "$page" ]; then
+        am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
+        # Merlin communicates the selected slot through am_webui_page.
+        page="$am_webui_page"
+    fi
+    printf '%s\n' "$page" | grep -qE '^user[0-9]+[.]asp$' || {
+        log_msg 'ERROR: no valid Web UI slot available'; return 1;
+    }
+    if ! cmp -s "$ADDON_DIR/amneziawg_page.asp" "$UI_WEB_DIR/$page"; then
+        pending="$UI_WEB_DIR/.awg_page.$$"
+        cp "$ADDON_DIR/amneziawg_page.asp" "$pending" &&
+            mv "$pending" "$UI_WEB_DIR/$page" || { rm -f "$pending"; return 1; }
+        changed=1
+    fi
+    if ! grep -F "url: \"$page\"" "$UI_MENU_FILE" | grep -qF 'tabName: "AmneziaWG"'; then
+        mount_menu_tree "$page" || return 1
+        changed=1
+    fi
+    grep -F "url: \"$page\"" "$UI_MENU_FILE" | grep -qF 'tabName: "AmneziaWG"' || return 1
+    [ "$changed" = 0 ] || log_msg "Web UI restored: $page"
+    return 0
 }
 
 # Bulk-load CIDR file into ipset using restore (much faster than individual adds)
@@ -1289,7 +1348,6 @@ do_stop(){
 # --- Install/Mount/Uninstall ---
 
 do_install_page(){
-    source /usr/sbin/helper.sh
     nvram get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
 
     mkdir -p "$ADDON_DIR"
@@ -1300,19 +1358,6 @@ do_install_page(){
     migrate_legacy_ipset
 
     [ -f "/tmp/amneziawg_page.asp" ] && cp /tmp/amneziawg_page.asp "$ADDON_DIR/amneziawg_page.asp"
-
-    # Clean old page slots before requesting a new one
-    for f in /www/user/user*.asp; do
-        grep -q "AmneziaWG" "$f" 2>/dev/null && rm -f "$f"
-    done
-
-    am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
-    [ "$am_webui_page" = "none" ] && { log_msg "ERROR: No page slot"; return 1; }
-
-    cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$am_webui_page"
-    mount_menu_tree "$am_webui_page"
-
-    echo '{"running":false,"peers":[],"log":"Installed."}' > "$STATUS_FILE"
 
     [ ! -f /jffs/scripts/service-event ] && echo "#!/bin/sh" > /jffs/scripts/service-event && chmod +x /jffs/scripts/service-event
     if ! grep -q "amneziawg" /jffs/scripts/service-event; then
@@ -1343,33 +1388,40 @@ do_install_page(){
 
     ensure_status_loop
     update_status
-    log_msg "Page installed: $am_webui_page"
+    do_mount_ui || return 1
+    log_msg "Page installation complete"
     echo "Installed. Access: VPN > AmneziaWG"
 }
 
 do_mount_ui(){
-    source /usr/sbin/helper.sh
-    # Clean old slots
-    for f in /www/user/user*.asp; do
-        grep -q "AmneziaWG" "$f" 2>/dev/null && rm -f "$f"
-    done
-    am_get_webui_page "$ADDON_DIR/amneziawg_page.asp"
-    if [ "$am_webui_page" != "none" ]; then
-        cp "$ADDON_DIR/amneziawg_page.asp" "/www/user/$am_webui_page"
-        mount_menu_tree "$am_webui_page"
-    fi
-
-    [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
-    ensure_status_loop
-    update_status
-
-    if autostart_enabled; then
-        sleep 10
-        do_start
-    fi
+    (
+        # UI work must not wait behind tunnel setup or rebuilding AntiFilter.
+        # This cron also operates when the tunnel is deliberately stopped.
+        [ -s "$ADDON_DIR/amneziawg_page.asp" ] || exit 1
+        if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then exit 1; fi
+        cru a awg_ui_watchdog "* * * * * '$ADDON_DIR/amneziawg.sh' mount_ui" || exit 1
+        LOCKDIR="$UI_LOCKDIR"
+        DISPATCH_LOCK=0
+        acquire_lock || exit 1
+        trap 'release_lock' 0
+        trap 'exit 1' 1 2 15
+        local attempt=0
+        while [ "$attempt" -lt 12 ]; do
+            if ui_mount_once; then
+                [ ! -f "$GEO_DIR/v2fly_categories.txt" ] || cp "$GEO_DIR/v2fly_categories.txt" "$UI_WEB_DIR/v2fly_categories.htm"
+                ensure_status_loop
+                exit 0
+            fi
+            attempt=$((attempt+1))
+            [ "$attempt" -ge 12 ] || sleep 5
+        done
+        log_msg 'ERROR: Web UI not ready; UI watchdog will retry'
+        exit 1
+    )
 }
 
 do_uninstall(){
+    cru d awg_ui_watchdog 2>/dev/null
     do_stop
 
     [ -x "$AUX_IPSET_SCRIPT" ] && "$AUX_IPSET_SCRIPT" --cleanup 2>/dev/null
@@ -1568,7 +1620,7 @@ if [ "$1" = "service_event" ]; then
     [ "$operation_id" = 0 ] || operation_write "$operation_id" running "$operation"
 fi
 case "$operation" in
-    status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
+    mount_ui|status|status_loop|prefill_worker|check_update|awgcheckupdate|update|awgdoupdate) ;;
     *)
         if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then
             log_msg 'ERROR: package update in progress'
