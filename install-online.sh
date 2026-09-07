@@ -1,8 +1,7 @@
 #!/bin/sh
-# AmneziaWG online installer for Asuswrt-Merlin ARM64.
+# AmneziaWG online installer for Asuswrt-Merlin ARM64 and ARMv7.
 
 REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
-SUPPORTED_ARCH="aarch64-3.10"
 TMP_DIR=""
 
 cleanup(){
@@ -28,14 +27,30 @@ if [ ! -x /opt/bin/curl ]; then
 fi
 
 CPU_ARCH=$(uname -m)
+
+case "$CPU_ARCH" in
+    aarch64|arm64)
+        WANTED_ARCH="aarch64-3.10"
+        ;;
+    armv7l|armv7)
+        WANTED_ARCH="armv7-3.2"
+        ;;
+    *)
+        echo "CPU architecture: $CPU_ARCH"
+        echo "Entware architecture: not compatible"
+        echo "ERROR: Unsupported CPU architecture: $CPU_ARCH"
+        exit 1
+        ;;
+esac
+
 PKG_ARCH=$(/opt/bin/opkg print-architecture 2>/dev/null | \
-    awk -v wanted="$SUPPORTED_ARCH" '$1=="arch" && $2==wanted {print $2; exit}')
+    awk -v wanted="$WANTED_ARCH" '$1=="arch" && $2==wanted {print $2; exit}')
 
 echo "CPU architecture: $CPU_ARCH"
 echo "Entware architecture: ${PKG_ARCH:-not compatible}"
 
-if [ "$CPU_ARCH" != "aarch64" ] || [ "$PKG_ARCH" != "$SUPPORTED_ARCH" ]; then
-    echo "ERROR: This release supports only ARM64/AArch64 with Entware $SUPPORTED_ARCH"
+if [ "$PKG_ARCH" != "$WANTED_ARCH" ]; then
+    echo "ERROR: Entware $WANTED_ARCH is required for $CPU_ARCH"
     exit 1
 fi
 
@@ -62,7 +77,7 @@ case "$VERSION" in
 esac
 
 IPK_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | \
-    grep "_${SUPPORTED_ARCH}\.ipk\"" | head -1 | \
+    grep "_${WANTED_ARCH}\.ipk\"" | head -1 | \
     sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/".*//')
 SUMS_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | \
     grep '/SHA256SUMS"' | head -1 | \
@@ -70,7 +85,7 @@ SUMS_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | \
 
 case "$IPK_URL" in
     https://github.com/${REPO}/releases/download/*) ;;
-    *) echo "ERROR: ARM64 package not found in release $VERSION"; exit 1 ;;
+    *) echo "ERROR: Package for $WANTED_ARCH not found in release $VERSION"; exit 1 ;;
 esac
 case "$SUMS_URL" in
     https://github.com/${REPO}/releases/download/*/SHA256SUMS) ;;

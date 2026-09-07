@@ -341,7 +341,7 @@ do_update(){
         trap 'exit 1' 1 2 15
         current=$(/opt/bin/opkg status amneziawg | awk '/^Version:/{print $2;exit}')
         arch=$(/opt/bin/opkg status amneziawg | awk '/^Architecture:/{print $2;exit}')
-        [ -n "$arch" ] || arch=$(/opt/bin/opkg print-architecture | awk '$2=="aarch64-3.10"{print $2;exit}')
+        [ -n "$arch" ] || arch=$(/opt/bin/opkg print-architecture 2>/dev/null | awk '$1=="arch" && ($2=="aarch64-3.10" || $2=="armv7-3.2"){print $2;exit}')
         latest=$(curl -fLsS --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${UPDATE_REPO}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([0-9.-]*\)".*/\1/p' | head -1)
         [ -n "$latest" ] || exit 1
         [ "$current" != "$latest" ] || { log_msg 'Package already up to date'; exit 0; }
