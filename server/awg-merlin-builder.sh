@@ -51,8 +51,10 @@ if [ "$latest_go" != "$current_go" ] || [ "$latest_tools" != "$current_tools" ];
     case "$revision" in *[!0-9]*|'') echo "ERROR: invalid package revision: $old_pkg"; exit 1 ;; esac
     new_pkg="${base_version}-$((revision + 1))"
 
-    sed -i "s/^ARG AWG_GO_TAG=.*/ARG AWG_GO_TAG=${latest_go}/" Dockerfile
-    sed -i "s/^ARG AWG_TOOLS_TAG=.*/ARG AWG_TOOLS_TAG=${latest_tools}/" Dockerfile
+    for dockerfile in Dockerfile Dockerfile.armv7; do
+        sed -i "s/^ARG AWG_GO_TAG=.*/ARG AWG_GO_TAG=${latest_go}/" "$dockerfile"
+        sed -i "s/^ARG AWG_TOOLS_TAG=.*/ARG AWG_TOOLS_TAG=${latest_tools}/" "$dockerfile"
+    done
     sed -i "s/^AWG_GO_TAG=.*/AWG_GO_TAG=\"\${AWG_GO_TAG:-${latest_go}}\"/" build.sh
     sed -i "s/^AWG_TOOLS_TAG=.*/AWG_TOOLS_TAG=\"\${AWG_TOOLS_TAG:-${latest_tools}}\"/" build.sh
     sed -i "s/^PKG_VERSION=.*/PKG_VERSION=\"${new_pkg}\"/" build-ipk.sh
@@ -72,26 +74,35 @@ bash tests/run.sh
 AWG_GO_TAG="$latest_go" AWG_TOOLS_TAG="$latest_tools" ./build.sh
 ./build-ipk.sh
 
-ipk="output/amneziawg_${new_pkg}_aarch64-3.10.ipk"
-[ -s "$ipk" ] || { echo "ERROR: package not created: $ipk"; exit 1; }
-file output/amneziawg-go output/awg "$ipk"
+ipk_arm64="output/amneziawg_${new_pkg}_aarch64-3.10.ipk"
+ipk_armv7="output/amneziawg_${new_pkg}_armv7-3.2.ipk"
+
+for ipk in "$ipk_arm64" "$ipk_armv7"; do
+    [ -s "$ipk" ] || { echo "ERROR: package not created: $ipk"; exit 1; }
+done
+
+file output/amneziawg-go output/awg \
+     output/amneziawg-go-arm output/awg-arm \
+     "$ipk_arm64" "$ipk_armv7"
 
 publish_dir="${RELEASE_DIR}/${new_pkg}"
 mkdir -p "$publish_dir"
-install -m 0644 "$ipk" "$publish_dir/"
+install -m 0644 "$ipk_arm64" "$ipk_armv7" "$publish_dir/"
 (
     cd "$publish_dir"
-    sha256sum "$(basename "$ipk")" > SHA256SUMS
+    sha256sum \
+        "$(basename "$ipk_arm64")" \
+        "$(basename "$ipk_armv7")" > SHA256SUMS
 )
 
 if [ "$changed" = true ]; then
-    git add Dockerfile build.sh build-ipk.sh
+    git add Dockerfile Dockerfile.armv7 build.sh build-ipk.sh
     git commit -m "Update AmneziaWG core to ${latest_go} / ${latest_tools}"
     git push origin main
 fi
 
 release_tag="v${new_pkg}"
-release_notes="AmneziaWG package for Asuswrt-Merlin ARM64.
+release_notes="AmneziaWG package for Asuswrt-Merlin ARM64 and ARMv7.
 
 - amneziawg-go: ${latest_go}
 - amneziawg-tools: ${latest_tools}
@@ -100,12 +111,12 @@ release_notes="AmneziaWG package for Asuswrt-Merlin ARM64.
 The router updater verifies SHA256SUMS before installation."
 
 if gh release view "$release_tag" --repo "$PUBLISH_REPO" >/dev/null 2>&1; then
-    gh release upload "$release_tag" "$publish_dir/$(basename "$ipk")" "$publish_dir/SHA256SUMS" \
+    gh release upload "$release_tag" "$publish_dir/$(basename "$ipk_arm64")" "$publish_dir/$(basename "$ipk_armv7")" "$publish_dir/SHA256SUMS" \
         --repo "$PUBLISH_REPO" --clobber
 else
-    gh release create "$release_tag" "$publish_dir/$(basename "$ipk")" "$publish_dir/SHA256SUMS" \
+    gh release create "$release_tag" "$publish_dir/$(basename "$ipk_arm64")" "$publish_dir/$(basename "$ipk_armv7")" "$publish_dir/SHA256SUMS" \
         --repo "$PUBLISH_REPO" --title "AmneziaWG Merlin ${new_pkg}" --notes "$release_notes"
 fi
 
 echo "Published ${PUBLISH_REPO} release ${release_tag}"
-sha256sum "$publish_dir/$(basename "$ipk")"
+sha256sum "$publish_dir/$(basename "$ipk_arm64")" "$publish_dir/$(basename "$ipk_armv7")"
