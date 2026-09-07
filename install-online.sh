@@ -26,6 +26,18 @@ if [ ! -x /opt/bin/curl ]; then
     exit 1
 fi
 
+if [ ! -x /opt/bin/sha256sum ]; then
+    echo "Installing SHA256 utility..."
+    /opt/bin/opkg update >/dev/null 2>&1 || {
+        echo "ERROR: Cannot update Entware package list"
+        exit 1
+    }
+    /opt/bin/opkg install coreutils-sha256sum || {
+        echo "ERROR: Cannot install coreutils-sha256sum"
+        exit 1
+    }
+fi
+
 CPU_ARCH=$(uname -m)
 
 case "$CPU_ARCH" in
@@ -105,7 +117,7 @@ echo "Downloading package and SHA256SUMS..."
     "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" || { echo "ERROR: SHA256SUMS download failed"; exit 1; }
 
 EXPECTED=$(awk -v f="$IPK_FILE" '$2==f || $2=="*" f {print $1; exit}' "$TMP_DIR/SHA256SUMS")
-ACTUAL=$(sha256sum "$TMP_DIR/$IPK_FILE" 2>/dev/null | awk '{print $1}')
+ACTUAL=$(/opt/bin/sha256sum "$TMP_DIR/$IPK_FILE" 2>/dev/null | awk '{print $1}')
 if [ -z "$EXPECTED" ] || [ "$ACTUAL" != "$EXPECTED" ]; then
     echo "ERROR: Package SHA256 mismatch"
     exit 1

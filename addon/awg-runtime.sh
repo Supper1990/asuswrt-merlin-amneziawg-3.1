@@ -316,7 +316,7 @@ fetch_verified_package(){
     curl -fLsS --connect-timeout 10 --max-time 180 "$base/$package" -o "$dir/$package" || return 1
     curl -fLsS --connect-timeout 10 --max-time 30 "$base/SHA256SUMS" -o "$dir/sums-$ver" || return 1
     expected=$(awk -v f="$package" '$2==f || $2=="*"f {print $1;exit}' "$dir/sums-$ver")
-    actual=$(sha256sum "$dir/$package" | awk '{print $1}')
+    actual=$(/opt/bin/sha256sum "$dir/$package" | awk '{print $1}')
     [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
     tar tzf "$dir/$package" | grep -q 'data.tar.gz' || return 1
 }

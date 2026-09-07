@@ -58,6 +58,7 @@ build_ipk(){
 Package: ${PKG_NAME}
 Version: ${PKG_VERSION}
 Section: net
+Depends: coreutils-sha256sum
 Architecture: ${arch}
 Maintainer: amneziawg-merlin
 Source: https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1
