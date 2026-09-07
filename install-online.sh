@@ -22,7 +22,7 @@ if [ ! -x /opt/bin/opkg ]; then
     echo "ERROR: Entware is not installed"
     exit 1
 fi
-if ! command -v curl >/dev/null 2>&1; then
+if [ ! -x /opt/bin/curl ]; then
     echo "ERROR: curl is not installed"
     exit 1
 fi
@@ -48,7 +48,7 @@ echo $$ > /tmp/.awg_package_lock/pid
 export AWG_PACKAGE_CHILD=1
 
 echo "Fetching latest release..."
-RELEASE_JSON=$(curl -sfL --connect-timeout 10 --max-time 30 \
+RELEASE_JSON=$(/opt/bin/curl -sfL --connect-timeout 10 --max-time 30 \
     "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)
 if [ -z "$RELEASE_JSON" ]; then
     echo "ERROR: Cannot reach the GitHub API"
@@ -84,9 +84,9 @@ echo "Latest version: $VERSION"
 echo "Package: $IPK_FILE"
 echo "Downloading package and SHA256SUMS..."
 
-curl -sfL --connect-timeout 10 --max-time 180 \
+/opt/bin/curl -sfL --connect-timeout 10 --max-time 180 \
     "$IPK_URL" -o "$TMP_DIR/$IPK_FILE" || { echo "ERROR: Package download failed"; exit 1; }
-curl -sfL --connect-timeout 10 --max-time 60 \
+/opt/bin/curl -sfL --connect-timeout 10 --max-time 60 \
     "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS" || { echo "ERROR: SHA256SUMS download failed"; exit 1; }
 
 EXPECTED=$(awk -v f="$IPK_FILE" '$2==f || $2=="*" f {print $1; exit}' "$TMP_DIR/SHA256SUMS")
