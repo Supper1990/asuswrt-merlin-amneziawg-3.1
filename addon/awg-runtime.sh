@@ -24,10 +24,10 @@ validate_runtime_settings(){
     [ "${v##*/}" -le 32 ] || return 1
     for item in $(get_setting awg_dns | tr ',' ' '); do valid_ipv4 "$item" || { log_msg 'ERROR: invalid DNS IPv4'; return 1; }; done
     for item in $(get_setting awg_geo_custom_domains | tr ',' ' '); do valid_domain "$item" || { log_msg 'ERROR: invalid custom domain'; return 1; }; done
-    for item in $(get_setting awg_geo_v2fly | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
+    for item in $(get_setting awg_geo_v2fly | tr 'A-Z' 'a-z' | tr ',' ' '); do
         valid_geosite_name "$item" || { log_msg 'ERROR: unsupported GeoSite category syntax'; return 1; }
     done
-    for item in $(get_setting awg_geo_v2fly_ip | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
+    for item in $(get_setting awg_geo_v2fly_ip | tr 'A-Z' 'a-z' | tr ',' ' '); do
         valid_geo_service_name "$item" || return 1
     done
     for item in $(get_setting awg_vpn_source_nets | tr ',' ' '); do
@@ -68,7 +68,7 @@ preflight_geo(){
         normalize_cidrs "$GEO_DIR/custom.check" "$GEO_DIR/custom.valid" || return 1
         rm -f "$GEO_DIR/custom.check" "$GEO_DIR/custom.valid"
     fi
-    for svc in $(get_setting awg_geo_v2fly | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do
+    for svc in $(get_setting awg_geo_v2fly | tr 'A-Z' 'a-z' | tr ',' ' '); do
         awk -v cat="${svc%@*}" '/^[[:space:]]*- name:/{n=$0;sub(/.*name:[[:space:]]*/,"",n);gsub(/"/,"",n);if(n==cat)found=1}END{exit !found}' "$GEO_DIR/v2fly_all.yml" || { log_msg "ERROR: unknown GeoSite category $svc"; return 1; }
     done
 }

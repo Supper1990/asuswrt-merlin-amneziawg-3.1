@@ -380,7 +380,7 @@ selected_geoip_services(){
     local raw svc selected=""
     raw=$(get_setting awg_geo_v2fly_ip)
     for svc in $(echo "$raw" | tr ',' ' '); do
-        svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+        svc=$(echo "$svc" | tr -d ' ' | tr 'A-Z' 'a-z')
         valid_geo_service_name "$svc" || continue
         case " $selected " in
             *" $svc "*) ;;
@@ -424,7 +424,7 @@ prune_unselected_geoip_lists(){
 # Download a single selected GeoIP service list (IPv4 only)
 download_geoip_service(){
     local svc="$1"
-    svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+    svc=$(echo "$svc" | tr -d ' ' | tr 'A-Z' 'a-z')
     valid_geo_service_name "$svc" || return 1
     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
@@ -703,7 +703,7 @@ setup_firewall_body(){
     rm -f "$GEO_DIR/domains/v2fly_"*.txt
     if [ -n "$geo_v2fly" ] && [ -f "$GEO_DIR/v2fly_all.yml" ]; then
         for svc in $(echo "$geo_v2fly" | tr ',' ' '); do
-            svc=$(echo "$svc" | tr -d ' ' | tr '[:upper:]' '[:lower:]')
+            svc=$(echo "$svc" | tr -d ' ' | tr 'A-Z' 'a-z')
             valid_geosite_name "$svc" || {
                 log_msg "WARNING: Invalid GeoSite category: $svc"
                 continue
