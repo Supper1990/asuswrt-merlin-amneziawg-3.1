@@ -44,22 +44,32 @@ The project provides a userspace implementation of AmneziaWG with configuration 
 
 ## Installation
 
-### Supported architecture
+### Supported architectures
 
-The published `.ipk` is built for **64-bit ARM processors**:
+The `.ipk` packages are available for two architectures:
 
-- CPU architecture: `ARM64` / `AArch64` (`uname -m` returns `aarch64`);
-- Entware package architecture: `aarch64-3.10`;
-- the package name ends with `_aarch64-3.10.ipk`.
+- **ARM64 / AArch64** — `aarch64` / Entware `aarch64-3.10`
+- **ARMv7 (32-bit ARM)** — `armv7l` / Entware `armv7-3.2`
 
-Check the router before installation:
+Check the architecture:
 
 ```sh
 uname -m
 /opt/bin/opkg print-architecture
 ```
 
-This package is not supported if `uname -m` does not return `aarch64` or the Entware list does not contain `aarch64-3.10`.
+The automatic installer detects the router architecture and selects the appropriate package.
+
+### Tested router models
+
+The addon has been successfully tested on:
+
+| Model | Architecture | Entware |
+|---|---|---|
+| ASUS RT-AX88U Pro | ARM64 / AArch64 | `aarch64-3.10` |
+| ASUS RT-AX82U | ARMv7 (32-bit ARM) | `armv7-3.2` |
+
+This list contains devices on which the addon has been tested in practice. Other routers running Asuswrt-Merlin with a compatible Entware architecture may also work even if they are not listed here.
 
 ### Automatic installation from GitHub
 
@@ -76,7 +86,7 @@ The installer checks the architecture, downloads the latest `.ipk` from **GitHub
 
 Download the `.ipk` package from **Releases**.
 
-Use the package with the `_aarch64-3.10.ipk` suffix.
+Use the package with the `_aarch64-3.10.ipk` suffix for ARM64 or `_armv7-3.2.ipk` for ARMv7.
 
 #### 1. Copy the package to the router
 
@@ -93,7 +103,7 @@ ssh admin@<ROUTER-IP>
 #### 3. Install the package
 
 ```sh
-/opt/bin/opkg install /tmp/amneziawg_*_aarch64-3.10.ipk
+/opt/bin/opkg install /tmp/amneziawg_*.ipk
 ```
 
 ### Open the web interface after installation
