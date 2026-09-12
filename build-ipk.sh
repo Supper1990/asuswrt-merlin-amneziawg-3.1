@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 bash tests/run.sh
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-27"
+PKG_VERSION="2.2.0-28"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
@@ -85,6 +85,9 @@ mkdir -p -m 700 /var/run/amneziawg
 mkdir -p /dev/net
 mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
 chmod 600 /dev/net/tun 2>/dev/null || true
+case "$(uname -m)" in
+    armv7l) echo 0 > /proc/sys/vm/overcommit_memory 2>/dev/null || true ;;
+esac
 if [ -f /usr/sbin/helper.sh ]; then
     /jffs/addons/amneziawg/amneziawg.sh install_page
 fi
@@ -152,6 +155,10 @@ PRERMEOF
 
     cat > "$DATA_DIR/opt/etc/init.d/S99amneziawg" << 'INITEOF'
 #!/bin/sh
+
+case "$(uname -m)" in
+    armv7l) echo 0 > /proc/sys/vm/overcommit_memory 2>/dev/null || true ;;
+esac
 
 case "$1" in
     start)
