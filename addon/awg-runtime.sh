@@ -1,6 +1,69 @@
 #!/bin/sh
 # Runtime helpers, sourced after the backend's function definitions.
 OP_FILE=/www/user/awg_operation.htm
+OVERCOMMIT_FILE=/proc/sys/vm/overcommit_memory
+OVERCOMMIT_STATE=/tmp/.awg_overcommit_memory
+
+prepare_memory_policy(){
+    [ "$(uname -m 2>/dev/null)" = "armv7l" ] || return 0
+    [ -r "$OVERCOMMIT_FILE" ] && [ -w "$OVERCOMMIT_FILE" ] || return 0
+
+    local current
+    current=$(cat "$OVERCOMMIT_FILE" 2>/dev/null) || return 0
+    case "$current" in 0|1|2) ;; *) return 0;; esac
+
+    if [ ! -f "$OVERCOMMIT_STATE" ]; then
+        printf '%s\n' "$current" > "$OVERCOMMIT_STATE" 2>/dev/null || {
+            log_msg 'WARNING: cannot save vm.overcommit_memory'
+            return 0
+        }
+    fi
+
+    if [ "$current" != "0" ]; then
+        if printf '0\n' > "$OVERCOMMIT_FILE" 2>/dev/null; then
+            log_msg "ARMv7 memory policy: vm.overcommit_memory $current -> 0"
+        else
+            log_msg 'WARNING: cannot set vm.overcommit_memory=0'
+            rm -f "$OVERCOMMIT_STATE"
+        fi
+    fi
+    return 0
+}
+
+restore_memory_policy(){
+    [ "$(uname -m 2>/dev/null)" = "armv7l" ] || return 0
+    [ -f "$OVERCOMMIT_STATE" ] || return 0
+
+    local saved
+    saved=$(cat "$OVERCOMMIT_STATE" 2>/dev/null)
+    case "$saved" in
+        0|1|2)
+            if [ -w "$OVERCOMMIT_FILE" ] &&
+               printf '%s\n' "$saved" > "$OVERCOMMIT_FILE" 2>/dev/null; then
+                log_msg "ARMv7 memory policy: vm.overcommit_memory restored to $saved"
+                rm -f "$OVERCOMMIT_STATE"
+            else
+                log_msg "WARNING: cannot restore vm.overcommit_memory=$saved"
+            fi
+            ;;
+        *) rm -f "$OVERCOMMIT_STATE" ;;
+    esac
+    return 0
+}
+
+sync_memory_policy(){
+    [ "$(uname -m 2>/dev/null)" = "armv7l" ] || return 0
+    if is_running && pidof amneziawg-go >/dev/null 2>&1; then
+        prepare_memory_policy
+        return 0
+    fi
+    # A status-loop probe may run while start/stop owns the dispatcher lock.
+    # Do not undo the start-side policy before the userspace daemon appears.
+    if [ "${operation:-}" = "status" ] && [ -d "$LOCKDIR" ]; then
+        return 0
+    fi
+    restore_memory_policy
+}
 
 operation_write(){
     case "$1" in ''|*[!0-9]*) return 1;; esac
@@ -49,6 +112,7 @@ validate_runtime_settings(){
         fi
     done < "$file"
     rm -f "$file"
+    prepare_memory_policy
 }
 
 preflight_geo(){
@@ -262,6 +326,7 @@ status_loop(){
 update_status(){
     local tmp="$STATUS_FILE.$$" running=false addr="" pub="" port="" dump row handshake=0 now state=stopped count=0 domains=0 af_count=0 af_enabled=false af_active=false version warnings=0
     now=$(date +%s)
+    sync_memory_policy
     if is_running && pidof amneziawg-go >/dev/null 2>&1; then
         running=true; state=interface_up
         addr=$(ip -4 addr show "$IFACE" | awk '/inet /{print $2;exit}')
