@@ -134,11 +134,11 @@ PRERMEOF
     cp "$awg_bin"                    "$DATA_DIR/opt/amneziawg/awg"
     printf '%s\n' "$AWG_GO_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-go.version"
     printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
-    cp addon/amneziawg.sh             "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
+    cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
     cp addon/awg-ipset-update.sh      "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
-    cp addon/awg-common.sh            "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
-    cp addon/awg-runtime.sh           "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
-    cp addon/amneziawg_page.asp       "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
+    cp addon/awg-common.sh          "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
+    cp addon/awg-runtime.sh         "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
+    cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 
     chmod 755 "$DATA_DIR/opt/amneziawg/amneziawg-go"
     chmod 755 "$DATA_DIR/opt/amneziawg/awg"
@@ -174,7 +174,7 @@ INITEOF
 
     cd "$DATA_DIR"
     "$TAR_BIN" czf "$WORK_DIR/data.tar.gz" --format=gnu ./opt ./jffs
-    cd "$SCRIPT_DIR"
+    cd - > /dev/null
 
     # --- Assemble .ipk (tar.gz format — Entware opkg uses tar.gz, not ar) ---
     cd "$WORK_DIR"
