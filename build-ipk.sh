@@ -85,9 +85,6 @@ mkdir -p -m 700 /var/run/amneziawg
 mkdir -p /dev/net
 mknod -m 600 /dev/net/tun c 10 200 2>/dev/null || true
 chmod 600 /dev/net/tun 2>/dev/null || true
-case "$(uname -m)" in
-    armv7l) echo 0 > /proc/sys/vm/overcommit_memory 2>/dev/null || true ;;
-esac
 if [ -f /usr/sbin/helper.sh ]; then
     /jffs/addons/amneziawg/amneziawg.sh install_page
 fi
@@ -137,11 +134,11 @@ PRERMEOF
     cp "$awg_bin"                    "$DATA_DIR/opt/amneziawg/awg"
     printf '%s\n' "$AWG_GO_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-go.version"
     printf '%s\n' "$AWG_TOOLS_VERSION" > "$DATA_DIR/opt/amneziawg/amneziawg-tools.version"
-    cp addon/amneziawg.sh            "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
+    cp addon/amneziawg.sh             "$DATA_DIR/jffs/addons/amneziawg/amneziawg.sh"
     cp addon/awg-ipset-update.sh      "$DATA_DIR/jffs/addons/amneziawg/awg-ipset-update.sh"
-    cp addon/awg-common.sh          "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
-    cp addon/awg-runtime.sh         "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
-    cp addon/amneziawg_page.asp      "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
+    cp addon/awg-common.sh            "$DATA_DIR/jffs/addons/amneziawg/awg-common.sh"
+    cp addon/awg-runtime.sh           "$DATA_DIR/jffs/addons/amneziawg/awg-runtime.sh"
+    cp addon/amneziawg_page.asp       "$DATA_DIR/jffs/addons/amneziawg/amneziawg_page.asp"
 
     chmod 755 "$DATA_DIR/opt/amneziawg/amneziawg-go"
     chmod 755 "$DATA_DIR/opt/amneziawg/awg"
@@ -155,10 +152,6 @@ PRERMEOF
 
     cat > "$DATA_DIR/opt/etc/init.d/S99amneziawg" << 'INITEOF'
 #!/bin/sh
-
-case "$(uname -m)" in
-    armv7l) echo 0 > /proc/sys/vm/overcommit_memory 2>/dev/null || true ;;
-esac
 
 case "$1" in
     start)
@@ -181,7 +174,7 @@ INITEOF
 
     cd "$DATA_DIR"
     "$TAR_BIN" czf "$WORK_DIR/data.tar.gz" --format=gnu ./opt ./jffs
-    cd - > /dev/null
+    cd "$SCRIPT_DIR"
 
     # --- Assemble .ipk (tar.gz format — Entware opkg uses tar.gz, not ar) ---
     cd "$WORK_DIR"
