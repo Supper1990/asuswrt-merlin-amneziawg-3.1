@@ -311,3 +311,39 @@ Validation: 40 test methods, including 7 simulated UI recovery tests. Real Merli
 Apply requests cooperative DNS-worker cancellation. The worker checks the request while waiting for DNS, terminates its own child `nslookup`, and releases its lock after `wait`. Each query has an eight-second sleep budget: 80 intervals of 0.1 seconds, or eight one-second intervals when fractional sleep is unavailable. Apply remains deferred when cancellation cannot be confirmed. Zombie processes are not considered active. During upgrades, a legacy worker retains the previous cancellation path until a new worker is started.
 
 Tests cover active-query cancellation, repeated execution, completion, query timeout, unrelated PIDs, process-state parsing and idle startup. Process tests mock `/proc` inspection; Apply still requires verification on the router.
+
+### 2.2.0-22 — deferred firewall replay
+
+A firewall restart event received while another addon operation is running is queued and replayed after the lock is released. A failed replay leaves the request pending for another attempt. [Change](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/6070d818556c5f3af0ea0233067caa0603f09253).
+
+### 2.2.0-23 — Geo cache persistence
+
+The permanent destination directory is created, if missing, before committing the prepared Geo lists. This fixes cache persistence when applying settings. [Change](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/1e86487fa0fd555b379d611a6481db589f8a3407).
+
+### 2.2.0-24 — clearer GeoSite warnings
+
+The log points to a file containing GeoSite conversion details instead of the ambiguous `see status`. The path uses the permanent `/opt/amneziawg/geo/domains/warnings.txt`, rather than a temporary Apply directory. This wording fix does not add support for previously unsupported GeoSite rules. [Change](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/ad91da6cba80d69287d1ee53bb3fa1e592fbfc5c).
+
+### 2.2.0-25 — ARMv7 builds and updates
+
+- ARMv7 is built alongside ARM64 using a separate `Dockerfile.armv7`.
+- The server builder synchronizes upstream tags for both architectures and publishes both packages with a shared `SHA256SUMS`.
+- The installer selects the package by architecture; built-in updates and rollback use the installed package architecture.
+
+ARMv7 preparation started with an additional package for 2.2.0-24; version 2.2.0-25 brings together the build and update changes. [Build support](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/c9bfccb6dd63463ac352ecc3d70089ba724ab62b), [installer and updater](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/f9f074633ce8f5a977723d90aa7ac9bba566cfd2).
+
+### 2.2.0-26 — SHA256 verification on ARMv7
+
+The package depends on `coreutils-sha256sum`. The installer and built-in updater explicitly invoke `/opt/bin/sha256sum`, without relying on PATH lookup for this command. [Change](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/9d61d75cb49bdcfd5f9b5e3fc88afa2758c6f8f7).
+
+### 2.2.0-27 — BusyBox tr compatibility
+
+Service-name lowercasing in `amneziawg.sh` and `awg-runtime.sh` uses `tr 'A-Z' 'a-z'` instead of the `[:upper:]`/`[:lower:]` classes. This addresses the GeoIP/GeoSite name corruption observed on ARMv7. [Change](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/8eaf9058928ae271e113a7c3a40e59a9465968f0).
+
+### 2.2.0-28 — ARMv7 memory policy
+
+On `armv7l`, the original `vm.overcommit_memory` value is saved to `/tmp/.awg_overcommit_memory` before AmneziaWG starts, and the value is set to `0`. Normal shutdown restores the saved value. Status checks also restore it after the process or interface disappears, with protection against interference during start/stop operations. ARM64 is unaffected by this logic.
+
+The change belongs to the shared start/stop lifecycle, not unconditional `postinst` or init-script code. `vm.overcommit_memory` is a system-wide kernel setting, not a per-process AmneziaWG limit. [Implementation](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/1f99c827b7c06aa157824f143ec4b5cf7fb55552), [installation-script cleanup](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/2974b84b043d9fb247a7bdb63439a9d0d5f986ef).
+
+**Verification status as of September 12, 2026:** the final 2.2.0-28 implementation has not been tested on a router. It was prepared following a reported `runtime: out of memory` crash on RT-AX82U; resolution of all tunnel shutdown causes and possible false watchdog restarts remains unconfirmed.
