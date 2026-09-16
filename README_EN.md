@@ -347,3 +347,10 @@ On `armv7l`, the original `vm.overcommit_memory` value is saved to `/tmp/.awg_ov
 The change belongs to the shared start/stop lifecycle, not unconditional `postinst` or init-script code. `vm.overcommit_memory` is a system-wide kernel setting, not a per-process AmneziaWG limit. [Implementation](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/1f99c827b7c06aa157824f143ec4b5cf7fb55552), [installation-script cleanup](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/2974b84b043d9fb247a7bdb63439a9d0d5f986ef).
 
 **Verification status as of September 12, 2026:** the final 2.2.0-28 implementation has not been tested on a router. It was prepared following a reported `runtime: out of memory` crash on RT-AX82U; resolution of all tunnel shutdown causes and possible false watchdog restarts remains unconfirmed.
+
+
+### 2.2.0-29 — Geo routing for router-originated traffic
+
+Adds an opt-in Router Traffic setting, disabled by default, applying selected GeoIP/GeoSite and custom lists to router-originated IPv4 traffic through a separate OUTPUT chain. Existing AntiFilter behavior is preserved. Includes AmneziaWG transport exclusions, cleanup on disable/stop, scoped Apply rollback and watchdog rule checks.
+
+User-provided RT-AX88U Pro / Merlin 3006.102.8_4 output verified activation, marking counters, awg0/table 300 selection for mark 0x100, watchdog restoration of a deleted OUTPUT hook, and disabling without watchdog reattaching it. Both packages were built; VPS tests completed without failures (56 tests, one skipped). ARMv7 device operation remains unverified; the earlier AX82U hang remains unexplained. [Validation details and limitations](docs/ROUTER-GEO-OUTPUT.md).

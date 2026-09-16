@@ -209,6 +209,8 @@ restore_rp_filter(){
 main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
+    router_geo_healthy || return 1
+
     lan_net=$(get_lan_net)
 
     iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
@@ -259,6 +261,7 @@ main_firewall_base_healthy(){
 
 managed_firewall_rules(){
     iptables-save -t mangle 2>/dev/null | grep "^-A $AWG_CHAIN "
+    iptables-save -t mangle 2>/dev/null | awk '$1=="-A" && ($2=="AWG_OUTPUT" || ($2=="OUTPUT" && /-j AWG_OUTPUT$/))'
     iptables-save -t nat 2>/dev/null | awk '/^-A PREROUTING / && /-i br0 / && /--dport 53 / && /-j DNAT/'
     iptables-save -t filter 2>/dev/null | awk '/^-A FORWARD / && /-i br0 / && /--dport (443|853) / && /-j REJECT/'
 }
@@ -611,6 +614,7 @@ cleanup_ipv6_block(){
 }
 
 cleanup_firewall(){
+    cleanup_router_geo || return 1
     # Unhook from PREROUTING, flush and delete custom chain
     iptables -t mangle -D PREROUTING -j "$AWG_CHAIN" 2>/dev/null
     iptables -t mangle -F "$AWG_CHAIN" 2>/dev/null
@@ -656,7 +660,7 @@ cleanup_firewall(){
 }
 
 setup_firewall_body(){
-    cleanup_firewall
+    cleanup_firewall || return 1
     ensure_main_routes || return 1
     ensure_base_firewall || return 1
 
@@ -929,6 +933,8 @@ setup_firewall_body(){
     # --- Single fwmark rule for all marked traffic ---
     ip rule add fwmark "$DIRECT_MARK" lookup main prio 9
     ip rule add fwmark "$FWMARK" lookup $RT_TABLE prio 98
+
+    setup_router_geo || return 1
 
     # --- Force DNS through dnsmasq whenever VPN is active ---
     if [ "$default_policy" != "direct" ] || [ "$has_geo" = true ]; then

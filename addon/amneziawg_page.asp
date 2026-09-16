@@ -342,6 +342,7 @@ function saveSettings(action){
     custom_settings.awg_geo_custom_ips = document.getElementById('geo_custom_ips').value;
     custom_settings.awg_geo_autoupdate = document.getElementById('geo_autoupdate').checked ? '1' : '0';
     custom_settings.awg_antifilter_enabled = document.getElementById('antifilter_enabled').checked ? '1' : '0';
+    custom_settings.awg_router_geo = document.getElementById('router_geo').checked ? '1' : '0';
 
     // Basic validation
     var pk = document.getElementById('awg_privatekey').value;
@@ -411,9 +412,9 @@ function serializeClients(){
 }
 
 function updateGeoVisibility(){
-    // Show geo settings if ANY device uses vpn_geo or default policy is vpn_geo
+    // Show Geo settings for router-only use as well as LAN policies.
     var defPolicy = document.getElementById('default_policy').value;
-    var hasGeo = (defPolicy === 'vpn_geo');
+    var hasGeo = (defPolicy === 'vpn_geo') || document.getElementById('router_geo').checked;
     if(!hasGeo){
         var selects = document.querySelectorAll('.client_policy');
         for(var i = 0; i < selects.length; i++){
@@ -441,6 +442,7 @@ function loadGeoSettings(){
 }
 
 function loadAntiFilterSettings(){
+    document.getElementById('router_geo').checked = (custom_settings.awg_router_geo === '1');
     var enabled = (custom_settings.awg_antifilter_enabled !== '0');
     var cb = document.getElementById('antifilter_enabled');
     antifilterRuntimeEnabled = enabled;
@@ -1212,6 +1214,15 @@ function initAutocompleteIp(){
                 </tr>
                 </table>
 
+                <div class="awg-section">Router Traffic</div>
+                <table width="100%" border="1" cellpadding="4" cellspacing="0" class="FormTable">
+                <tr>
+                    <th width="35%">Router Traffic</th>
+                    <td><label><input type="checkbox" id="router_geo" onchange="updateGeoVisibility();"> Apply selected GeoIP/GeoSite and custom lists to the router itself</label>
+                        <div style="color:#888; font-size:11px; margin-top:5px;">IPv4 only. Disabled by default; click Apply to save. AntiFilter remains independent. Domain rules require addresses resolved through the router's dnsmasq.</div>
+                    </td>
+                </tr>
+                </table>
                 <div class="awg-section">Device Rules</div>
                 <table width="100%" border="0" cellpadding="4" cellspacing="0" class="FormTable_table" id="awg_client_table">
                 <thead><tr>
