@@ -4,6 +4,73 @@ OP_FILE=/www/user/awg_operation.htm
 OVERCOMMIT_FILE=/proc/sys/vm/overcommit_memory
 OVERCOMMIT_STATE=/tmp/.awg_overcommit_memory
 
+# Opt-in IPv4 routing for locally generated traffic. LAN policy and the
+# independent AntiFilter OUTPUT hook retain their existing behavior.
+router_geo_enabled(){
+    [ "$(get_setting awg_router_geo)" = "1" ]
+}
+
+router_transport_port(){
+    local port
+    port=$("$AWG_BIN" show "$IFACE" listen-port 2>/dev/null) || return 1
+    case "$port" in ''|*[!0-9]*) return 1;; esac
+    [ "$port" -gt 0 ] && [ "$port" -le 65535 ] || return 1
+    printf '%s\n' "$port"
+}
+
+cleanup_router_geo(){
+    local n=0
+    while iptables -t mangle -C OUTPUT -j AWG_OUTPUT 2>/dev/null; do
+        [ "$n" -lt 100 ] || return 1
+        iptables -t mangle -D OUTPUT -j AWG_OUTPUT || return 1
+        n=$((n+1))
+    done
+    iptables -t mangle -F AWG_OUTPUT 2>/dev/null
+    iptables -t mangle -X AWG_OUTPUT 2>/dev/null
+    return 0
+}
+
+setup_router_geo(){
+    router_geo_enabled || return 0
+    local port endpoint lan net
+    # Refuse to enable without a verified transport exclusion. The local UDP
+    # port also protects the transport when the peer changes its endpoint.
+    port=$(router_transport_port) || { log_msg 'ERROR: cannot determine AmneziaWG transport port'; return 1; }
+    endpoint=$("$AWG_BIN" show "$IFACE" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+    endpoint=${endpoint%:*}
+    lan=$(get_lan_net)
+    iptables -t mangle -N AWG_OUTPUT || return 1
+    iptables -t mangle -A AWG_OUTPUT -m mark ! --mark 0x0/0xffffffff -j RETURN || return 1
+    iptables -t mangle -A AWG_OUTPUT -p udp --sport "$port" -j RETURN || return 1
+    iptables -t mangle -A AWG_OUTPUT -m addrtype --dst-type LOCAL -j RETURN || return 1
+    for net in 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32 $lan; do
+        iptables -t mangle -A AWG_OUTPUT -d "$net" -j RETURN || return 1
+    done
+    iptables -t mangle -A AWG_OUTPUT -p udp -m multiport --dports 67,68,123 -j RETURN || return 1
+    if valid_ipv4 "$endpoint"; then
+        iptables -t mangle -A AWG_OUTPUT -d "$endpoint/32" -j RETURN || return 1
+    fi
+    iptables -t mangle -A AWG_OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+    # Run before AntiFilter, which already preserves mark 0x100.
+    iptables -t mangle -I OUTPUT 1 -j AWG_OUTPUT
+}
+
+router_geo_healthy(){
+    local hooks port
+    hooks=$(iptables -t mangle -S OUTPUT 2>/dev/null) || return 1
+    if ! router_geo_enabled; then
+        printf '%s\n' "$hooks" | grep -q -- '-j AWG_OUTPUT' && return 1
+        iptables -t mangle -S AWG_OUTPUT >/dev/null 2>&1 && return 1
+        return 0
+    fi
+    [ "$(printf '%s\n' "$hooks" | grep -c '^-A OUTPUT -j AWG_OUTPUT$')" = 1 ] || return 1
+    # Checking order prevents an earlier AntiFilter mark bypassing Geo policy.
+    [ "$(printf '%s\n' "$hooks" | awk '/^-A /{print;exit}')" = '-A OUTPUT -j AWG_OUTPUT' ] || return 1
+    port=$(router_transport_port) || return 1
+    iptables -t mangle -C AWG_OUTPUT -p udp --sport "$port" -j RETURN || return 1
+    iptables -t mangle -C AWG_OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK"
+}
+
 prepare_memory_policy(){
     [ "$(uname -m 2>/dev/null)" = "armv7l" ] || return 0
     [ -r "$OVERCOMMIT_FILE" ] && [ -w "$OVERCOMMIT_FILE" ] || return 0
@@ -78,6 +145,8 @@ operation_write(){
 
 validate_runtime_settings(){
     local v item file line dev name policy mac seen=" "
+    v=$(get_setting awg_router_geo)
+    case "$v" in ''|0|1) ;; *) log_msg 'ERROR: invalid router Geo setting'; return 1;; esac
     v=$(get_setting awg_default_policy)
     case "$v" in ''|direct|vpn_all|vpn_geo) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
     v=$(get_setting awg_address)
@@ -505,16 +574,19 @@ restore_owned_rules(){
             if [ "$table" = mangle ] && grep -q '^:AWG ' "$snapshot"; then
                 printf ':AWG - [0:0]\n'
             fi
+            if [ "$table" = mangle ] && grep -q '^:AWG_OUTPUT ' "$snapshot"; then
+                printf ':AWG_OUTPUT - [0:0]\n'
+            fi
             awk -v wanted="$table" '
                 /^\*/{table=substr($0,2);delete index_by_chain;next}
                 table!=wanted{next}
                 /^-A /{
                     chain=$2; index_by_chain[chain]++
-                    own=(wanted=="mangle" && ($2=="AWG" || ($2=="PREROUTING" && /-j AWG$/))) ||
+                    own=(wanted=="mangle" && ($2=="AWG" || $2=="AWG_OUTPUT" || ($2=="OUTPUT" && /-j AWG_OUTPUT$/) || ($2=="PREROUTING" && /-j AWG$/))) ||
                         (wanted=="nat" && $2=="PREROUTING" && /-i br0 / && /--dport 53 / && /-j DNAT/) ||
                         (wanted=="filter" && $2=="FORWARD" && /-i br0 / && /--dport (443|853) / && /-j REJECT/)
                     if(own){
-                        if(chain=="AWG")print
+                        if(chain=="AWG" || chain=="AWG_OUTPUT")print
                         else {sub(/^-A [^ ]+ /, "");print "-I " chain " " index_by_chain[chain] " " $0}
                     }
                 }' "$snapshot"
