@@ -1,7 +1,17 @@
-# Router Geo routing — development branch
+# Router Geo routing — 2.2.0-29
 
-This change is not a release and has not been validated on Asuswrt-Merlin.
-It does not address or diagnose the reported ARMv7 hang. Memory policy and
+On September 16, 2026, the user tested the candidate on RT-AX88U Pro,
+Asuswrt-Merlin 3006.102.8_4 (ARM64). Reported terminal output confirms
+activation, marking counters, membership of the requested destination in
+awg_dst, and a marked route lookup selecting awg0/table 300. After removing
+the OUTPUT hook, watchdog restored it through firewall repair; the supplied
+repair log contained no daemon restart. Disabling the checkbox removed the
+chain/hook, and watchdog did not reattach it. A curl request received an HTTP
+response, but no packet capture was performed to trace that exact request.
+
+Both architecture packages built on the VPS. ARMv7 device operation,
+reboot persistence and on-device failure rollback remain unverified.
+This change does not address or diagnose the reported ARMv7 hang. Memory policy and
 the existing tunnel watchdog restart policy are unchanged.
 
 ## Behavior
