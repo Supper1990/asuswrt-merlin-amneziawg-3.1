@@ -53,6 +53,56 @@ restart_dnsmasq_and_wait "$TIMEOUT"
                     'tcp 0 0 127.0.0.1:553 0.0.0.0:* LISTEN 101/dnsmasq')
                 self.assertNotEqual(result.returncode, 0)
 
+    def active_config_case(self, previous_dns, current_dns,
+                           previous_include, current_include, listener):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {}
+            for name, content in (
+                    ('previous_dns', previous_dns), ('current_dns', current_dns),
+                    ('previous_include', previous_include),
+                    ('current_include', current_include)):
+                paths[name] = str(Path(d, name))
+                if content is not None:
+                    Path(paths[name]).write_text(content)
+            script = functions(MAIN, 'dnsmasq_listen_port',
+                                'dnsmasq_listener_ready',
+                                'optional_files_equal',
+                                'dnsmasq_config_is_active') + r'''
+netstat(){ printf '%s\n' "$LISTENER"; }
+dnsmasq_config_is_active "$PREVIOUS_DNS" "$PREVIOUS_INCLUDE"
+'''
+            conf = Path(d, 'dnsmasq.conf')
+            conf.write_text('port=553\n')
+            return subprocess.run(
+                ['/bin/sh'], input=script, text=True, capture_output=True,
+                timeout=5, env=dict(os.environ, DNSMASQ_CONF=str(conf),
+                                    DNSMASQ_AWG_CONF=paths['current_dns'],
+                                    DNSMASQ_INCLUDE=paths['current_include'],
+                                    PREVIOUS_DNS=paths['previous_dns'],
+                                    PREVIOUS_INCLUDE=paths['previous_include'],
+                                    LISTENER=listener))
+
+    def test_unchanged_active_dnsmasq_config_skips_restart(self):
+        result = self.active_config_case(
+            'ipset=/example/awg_dst\n', 'ipset=/example/awg_dst\n',
+            'conf-file=/jffs/awg.conf\n', 'conf-file=/jffs/awg.conf\n',
+            'udp 0 0 127.0.0.1:553 0.0.0.0:* 202/dnsmasq')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_changed_dnsmasq_config_requires_restart(self):
+        result = self.active_config_case(
+            'ipset=/old/awg_dst\n', 'ipset=/new/awg_dst\n',
+            'conf-file=/jffs/awg.conf\n', 'conf-file=/jffs/awg.conf\n',
+            'udp 0 0 127.0.0.1:553 0.0.0.0:* 202/dnsmasq')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_listener_requires_restart_even_when_files_match(self):
+        result = self.active_config_case(
+            'ipset=/example/awg_dst\n', 'ipset=/example/awg_dst\n',
+            'conf-file=/jffs/awg.conf\n', 'conf-file=/jffs/awg.conf\n',
+            'udp 0 0 127.0.0.1:53 0.0.0.0:* 202/AdGuardHome')
+        self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

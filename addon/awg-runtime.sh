@@ -266,7 +266,7 @@ setup_firewall(){
             case "$1 $2" in 'rule add'|'route replace') [ "$code" = 0 ] || { log_msg "ERROR: ip operation failed (exit $code): $*"; exit 42; };; esac
             return "$code"
         }
-        setup_firewall_body || { log_msg 'ERROR: firewall setup did not complete'; exit 1; }
+        setup_firewall_body "$txn/dns" "$txn/include" || { log_msg 'ERROR: firewall setup did not complete'; exit 1; }
         main_firewall_base_healthy || { log_msg 'ERROR: firewall verification did not pass'; exit 1; }
     )
     rc=$?

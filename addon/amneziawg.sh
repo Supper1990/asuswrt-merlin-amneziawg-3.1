@@ -316,6 +316,25 @@ dnsmasq_listener_ready(){
         END { exit !found }'
 }
 
+optional_files_equal(){
+    local previous="$1" current="$2"
+    [ -n "$previous" ] || return 1
+    if [ -f "$previous" ]; then
+        [ -f "$current" ] && cmp -s "$previous" "$current"
+    else
+        [ ! -e "$current" ]
+    fi
+}
+
+# A firewall-only replay must not interrupt DNS when dnsmasq is already
+# serving the exact configuration that was active before the rebuild.
+dnsmasq_config_is_active(){
+    local previous_dns="$1" previous_include="$2"
+    optional_files_equal "$previous_dns" "$DNSMASQ_AWG_CONF" || return 1
+    optional_files_equal "$previous_include" "$DNSMASQ_INCLUDE" || return 1
+    dnsmasq_listener_ready
+}
+
 # Restart dnsmasq and wait until its real listener is ready.  A DNS query to
 # 127.0.0.1:53 is not a valid probe when another resolver owns that port.
 restart_dnsmasq_and_wait(){
@@ -902,6 +921,7 @@ cleanup_firewall(){
 }
 
 setup_firewall_body(){
+    local previous_dns="${1:-}" previous_include="${2:-}"
     cleanup_firewall || return 1
     ensure_main_routes || return 1
     ensure_base_firewall || return 1
@@ -1183,11 +1203,15 @@ setup_firewall_body(){
         setup_dns_interception
     fi
 
-    # --- Restart dnsmasq if geo active ---
-    if true; then
+    # Restart only when the generated files changed or the expected listener
+    # is absent. A deferred firewall replay commonly regenerates byte-for-byte
+    # identical files and must not cause another DNS outage.
+    if dnsmasq_config_is_active "$previous_dns" "$previous_include"; then
+        log_msg "dnsmasq configuration unchanged; restart skipped"
+    else
         restart_dnsmasq_and_wait 15 || return 1
-        ensure_adguard_dns || return 1
     fi
+    ensure_adguard_dns || return 1
 
     # Existing unrelated sessions are retained. Selective invalidation only.
     flush_conntrack
