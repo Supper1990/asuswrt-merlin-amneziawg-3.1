@@ -126,6 +126,7 @@ managed_firewall_rules
                        AWG_CHAIN='AWG', FWMARK='0x100', DIRECT_MARK='0x101', IFACE='awg0', RT_TABLE='300', IPSET_NAME='awg_dst')
             stubs = '\n'.join(name + '(){ :; }' for name in ('cleanup_firewall', 'prune_unselected_geoip_lists',
                 'selected_geoip_services', 'save_clients', 'setup_dns_interception', 'restart_dnsmasq_and_wait',
+                'ensure_adguard_dns',
                 'flush_conntrack', 'save_and_set_rp_filter', 'ensure_ui_mark_nat', 'repair_aux_routing',
                 'register_managed_cron', 'setup_router_geo', 'managed_firewall_rules', 'log_msg', 'ensure_main_routes', 'ensure_base_firewall', 'dnsmasq'))
             r = self.run_shell(functions(MAIN, 'setup_firewall_body') + '\n' + stubs + r'''

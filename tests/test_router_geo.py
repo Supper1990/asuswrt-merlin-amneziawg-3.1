@@ -140,6 +140,7 @@ ensure_status_loop(){ :; }
 save_and_set_rp_filter(){ :; }
 ensure_ui_mark_nat(){ :; }
 repair_aux_routing(){ :; }
+ensure_adguard_dns(){ :; }
 do_stop(){ echo UNEXPECTED_STOP; }
 do_start(){ echo UNEXPECTED_START; }
 do_watchdog

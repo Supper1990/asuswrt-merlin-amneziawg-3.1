@@ -310,8 +310,27 @@ pre_resolve_domains_async(){
     "$ADDON_DIR/amneziawg.sh" prefill_worker </dev/null >/dev/null 2>&1 &
 }
 
+# Extract IPv4 answers returned through the local resolver and add them to the
+# dynamic part of awg_dst ourselves.  This keeps prefill effective even when
+# AdGuard Home answers from its cache and dnsmasq never observes the query.
+prefill_add_answers(){
+    local response="$1" answers="$2" ip added=0 router_ip
+    awk '$1=="Address:" || ($1=="Address" && $2 ~ /^[0-9]+:$/) {
+            value=$NF; sub(/#.*/, "", value); print value
+         }' "$response" 2>/dev/null | sort -u > "$answers" || return 1
+    router_ip=$(get_router_ip)
+    while IFS= read -r ip; do
+        valid_ipv4 "$ip" || continue
+        [ "$ip" != "127.0.0.1" ] || continue
+        [ -z "$router_ip" ] || [ "$ip" != "$router_ip" ] || continue
+        ipset add "$IPSET_NAME" "$ip" timeout 86400 -exist || return 1
+        added=$((added + 1))
+    done < "$answers"
+    printf '%s\n' "$added"
+}
+
 prefill_worker(){
-    local old domain n=0 ok=0 failed=0 domains poll_delay=1 poll_limit=8
+    local old domain n=0 ok=0 failed=0 added=0 domain_added domains response answers poll_delay=1 poll_limit=8
     DNS_QUERY_PID=""
     [ -f /tmp/.awg_dns_pending ] || return 0
     if ! mkdir "$DNS_PREFILL_LOCK" 2>/dev/null; then
@@ -336,13 +355,15 @@ prefill_worker(){
         rm -f /tmp/.awg_dns_pending
         [ -s "$DNSMASQ_AWG_CONF" ] || continue
         domains="$DNS_PREFILL_LOCK/domains"
+        response="$DNS_PREFILL_LOCK/response"
+        answers="$DNS_PREFILL_LOCK/answers"
         awk -F/ '/^ipset=/{for(i=2;i<NF;i++)if($i!="")print $i}' "$DNSMASQ_AWG_CONF" | sort -u > "$domains"
-        ok=0; failed=0
+        ok=0; failed=0; added=0
         log_msg 'Domain pre-resolution started'
         while IFS= read -r domain; do
             [ -n "$domain" ] || continue
             [ ! -f "$DNS_PREFILL_LOCK/stop" ] || return 0
-            nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
+            nslookup "$domain" 127.0.0.1 > "$response" 2>&1 &
             DNS_QUERY_PID=$!
             n=0
             while prefill_process_active "$DNS_QUERY_PID"; do
@@ -355,13 +376,18 @@ prefill_worker(){
                 wait "$DNS_QUERY_PID" 2>/dev/null
                 failed=$((failed+1))
             elif wait "$DNS_QUERY_PID" 2>/dev/null; then
-                ok=$((ok+1))
+                if domain_added=$(prefill_add_answers "$response" "$answers"); then
+                    ok=$((ok+1))
+                    added=$((added+domain_added))
+                else
+                    failed=$((failed+1))
+                fi
             else
                 failed=$((failed+1))
             fi
             DNS_QUERY_PID=""
         done < "$domains"
-        log_msg "Domain pre-resolution finished: success=$ok failed=$failed"
+        log_msg "Domain pre-resolution finished: success=$ok failed=$failed added=$added"
         update_status
     done
 }

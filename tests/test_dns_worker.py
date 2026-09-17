@@ -25,6 +25,10 @@ class DNSWorkerTests(unittest.TestCase):
             '. ' + shlex.quote(str(self.root / 'runtime.sh')) + '\n' +
             '''log_msg(){ echo "$*"; }
 update_status(){ :; }
+get_router_ip(){ echo 192.168.50.1; }
+valid_ipv4(){ printf '%s\n' "$1" | grep -qE '^([0-9]{1,3}\\.){3}[0-9]{1,3}$'; }
+IPSET_NAME=awg_dst
+ipset(){ echo "$*" >> "''' + str(self.root / 'ipset.trace') + '''"; }
 # Executor host /proc uses different PIDs: mock only process inspection.
 # Child processes, signals, waits and lock handling below remain real.
 prefill_process_active(){ kill -0 "$1" 2>/dev/null; }
@@ -117,3 +121,27 @@ prefill_worker_owned(){ [ "$1" = "$(cat "$DNS_PREFILL_LOCK/test_owner" 2>/dev/nu
     def test_idle_worker_does_not_create_lock(self):
         self.assertEqual(self.run_cmd('prefill_worker').returncode, 0)
         self.assertFalse(self.lock.exists())
+
+    def test_successful_answers_are_added_directly_to_ipset(self):
+        query = self.root / 'nslookup'
+        query.write_text('''#!/bin/sh
+cat <<'EOF'
+Server: 127.0.0.1
+Address: 127.0.0.1#53
+
+Name: one.example
+Address: 203.0.113.10
+Address 1: 203.0.113.11
+Address: 192.168.50.1
+EOF
+''')
+        query.chmod(0o755)
+        self.pending.touch()
+        result = self.run_cmd('prefill_worker')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        trace = (self.root / 'ipset.trace').read_text()
+        self.assertIn('add awg_dst 203.0.113.10 timeout 86400 -exist', trace)
+        self.assertIn('add awg_dst 203.0.113.11 timeout 86400 -exist', trace)
+        self.assertNotIn('127.0.0.1', trace)
+        self.assertNotIn('192.168.50.1', trace)
+        self.assertIn('success=2 failed=0 added=4', result.stdout)
