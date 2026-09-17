@@ -40,6 +40,32 @@ class Recovery(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertEqual((lock / 'pid').read_text(), str(os.getpid()))
 
+    def test_deferred_firewall_replay_keeps_dispatch_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / 'lock'
+            lock.mkdir()
+            pending = Path(d) / 'pending'
+            pending.touch()
+            r = self.run_shell(
+                functions(MAIN, 'replay_pending_firewall', 'finish_dispatch') + r'''
+is_running(){ return 0; }
+log_msg(){ :; }
+do_firewall_restart(){
+    [ -d "$LOCKDIR" ] || return 1
+    echo lock-held
+}
+main_firewall_healthy(){ return 0; }
+operation=start
+DISPATCH_LOCK=1
+finish_dispatch
+[ "$DISPATCH_LOCK" = 0 ]
+[ ! -e "$LOCKDIR" ]
+''', {'LOCKDIR': str(lock), 'FIREWALL_PENDING': str(pending)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), 'lock-held')
+            self.assertFalse(lock.exists())
+            self.assertFalse(pending.exists())
+
     def test_watchdog_retains_retry_after_failure(self):
         r = self.run_shell(functions(MAIN, 'do_watchdog') + '''
 ip(){ return 1; }

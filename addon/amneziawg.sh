@@ -1896,6 +1896,22 @@ replay_pending_firewall(){
     return 0
 }
 
+finish_dispatch(){
+    [ "${DISPATCH_LOCK:-0}" = "1" ] || return 0
+
+    # Keep the dispatcher lock while replaying a deferred firewall-start.
+    # Releasing it first allows watchdog or another service event to clean and
+    # rebuild the same chains concurrently with this replay.
+    if [ "$operation" != "firewall_restart" ] &&
+       [ -f "$FIREWALL_PENDING" ]; then
+        replay_pending_firewall || true
+    fi
+
+    trap - 0
+    rm -rf "$LOCKDIR"
+    DISPATCH_LOCK=0
+}
+
 # --- Main ---
 
 # Serialize runtime changes. Package upgrades manage stop/install separately
@@ -1967,17 +1983,8 @@ if [ -n "${operation_id:-}" ] && [ "$operation_id" != 0 ]; then
     fi
 fi
 
-# Release the dispatcher lock explicitly, then immediately replay a
-# firewall-start event that arrived while the addon was busy.
-if [ "${DISPATCH_LOCK:-0}" = "1" ]; then
-    trap - 0
-    rm -rf "$LOCKDIR"
-    DISPATCH_LOCK=0
-
-    if [ "$operation" != "firewall_restart" ] &&
-       [ -f "$FIREWALL_PENDING" ]; then
-        replay_pending_firewall || true
-    fi
-fi
+# Replay a queued firewall-start before releasing the dispatcher lock so a
+# watchdog run cannot rebuild the same chains concurrently.
+finish_dispatch
 
 exit "$operation_result"
