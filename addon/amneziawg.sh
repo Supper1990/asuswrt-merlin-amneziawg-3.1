@@ -36,6 +36,7 @@ LOCKDIR="/tmp/.awg_lock"
 AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
 UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
 V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text"
+DNSMASQ_CONF="${DNSMASQ_CONF:-/etc/dnsmasq.conf}"
 
 # Ensure Entware binaries are in PATH (not set when called from httpd/service-event)
 export PATH="/opt/bin:/opt/sbin:$PATH"
@@ -288,14 +289,40 @@ wait_for_dns(){
     return 1
 }
 
-# Restart dnsmasq and wait until the replacement daemon has loaded its config.
+# Read the effective DNS listener port written by Merlin.  This matters when
+# AdGuard Home owns :53 and dnsmasq is moved to (for example) :553.
+dnsmasq_listen_port(){
+    local port
+    port=$(awk -F= '
+        /^[[:space:]]*port[[:space:]]*=/ {
+            value=$2; gsub(/[[:space:]]/, "", value); port=value
+        }
+        END { print port }' "$DNSMASQ_CONF" 2>/dev/null)
+    [ -n "$port" ] || port=53
+    case "$port" in ''|*[!0-9]*) return 1;; esac
+    [ "$port" -gt 0 ] && [ "$port" -le 65535 ] || return 1
+    printf '%s\n' "$port"
+}
+
+dnsmasq_listener_ready(){
+    local port
+    port=$(dnsmasq_listen_port) || return 1
+    netstat -lnp 2>/dev/null | awk -v wanted=":$port" '
+        ($1=="tcp" || $1=="udp") && $4 ~ (wanted "$") && $NF ~ /dnsmasq/ {
+            found=1
+        }
+        END { exit !found }'
+}
+
+# Restart dnsmasq and wait until its real listener is ready.  A DNS query to
+# 127.0.0.1:53 is not a valid probe when another resolver owns that port.
 restart_dnsmasq_and_wait(){
     local old_pid current_pid i=0 max="${1:-15}"
     old_pid=$(pidof dnsmasq 2>/dev/null)
     service restart_dnsmasq >/dev/null 2>&1
     while [ $i -lt "$max" ]; do
         current_pid=$(pidof dnsmasq 2>/dev/null)
-        if [ -n "$current_pid" ] && nslookup localhost 127.0.0.1 >/dev/null 2>&1; then
+        if [ -n "$current_pid" ] && dnsmasq_listener_ready; then
             if [ -z "$old_pid" ] || [ "$current_pid" != "$old_pid" ] || [ $i -ge 3 ]; then
                 return 0
             fi

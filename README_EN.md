@@ -354,3 +354,9 @@ The change belongs to the shared start/stop lifecycle, not unconditional `postin
 Adds an opt-in Router Traffic setting, disabled by default, applying selected GeoIP/GeoSite and custom lists to router-originated IPv4 traffic through a separate OUTPUT chain. Existing AntiFilter behavior is preserved. Includes AmneziaWG transport exclusions, cleanup on disable/stop, scoped Apply rollback and watchdog rule checks.
 
 User-provided RT-AX88U Pro / Merlin 3006.102.8_4 output verified activation, marking counters, awg0/table 300 selection for mark 0x100, watchdog restoration of a deleted OUTPUT hook, and disabling without watchdog reattaching it. Both packages were built; VPS tests completed without failures (56 tests, one skipped). ARMv7 device operation remains unverified; the earlier AX82U hang remains unexplained. [Validation details and limitations](docs/ROUTER-GEO-OUTPUT.md).
+
+### 2.2.0-30 — prefill with AdGuard Home and a non-standard dnsmasq port
+
+Background prefill now extracts IPv4 addresses from successful local-resolver responses and adds them directly to the dynamic part of `awg_dst` with a 86400-second timeout. An AdGuard Home cache hit can therefore no longer prevent repopulation of a recreated ipset when the query does not reach dnsmasq.
+
+dnsmasq restart readiness reads the effective `port=` from `/etc/dnsmasq.conf` and checks a listener owned by dnsmasq. It no longer probes `127.0.0.1:53`, which can belong to a different DNS service when AdGuard Home is installed. Local tests model port 553, a missing expected listener, direct insertion of multiple IPv4 answers, worker cancellation and query timeouts. Merlin validation of this candidate is still required.
