@@ -37,6 +37,8 @@ AUX_IPSET_SCRIPT="$ADDON_DIR/awg-ipset-update.sh"
 UPDATE_REPO="Supper1990/asuswrt-merlin-amneziawg-3.1"
 V2FLY_GEOIP_BASE="https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text"
 DNSMASQ_CONF="${DNSMASQ_CONF:-/etc/dnsmasq.conf}"
+ADGUARD_INIT="${ADGUARD_INIT:-/opt/etc/init.d/S99AdGuardHome}"
+ADGUARD_PROC_ROOT="${ADGUARD_PROC_ROOT:-/proc}"
 
 # Ensure Entware binaries are in PATH (not set when called from httpd/service-event)
 export PATH="/opt/bin:/opt/sbin:$PATH"
@@ -331,6 +333,219 @@ restart_dnsmasq_and_wait(){
         i=$((i + 1))
     done
     log_msg "WARNING: dnsmasq restart timeout"
+    return 1
+}
+
+# Return the PID of AdGuard Home only when it is the process that actually
+# owns DNS port 53. Merely finding an installed binary is not enough: AGH may
+# be disabled while another resolver is active.
+adguard_dns_pid(){
+    netstat -lnp 2>/dev/null | awk '
+        ($1=="tcp" || $1=="udp") && $4 ~ /:53$/ && $NF ~ /\/AdGuardHome$/ {
+            split($NF, owner, "/")
+            if (owner[1] ~ /^[0-9]+$/) { print owner[1]; exit }
+        }'
+}
+
+# Read the configuration path from the running process instead of assuming an
+# installer-specific location. /proc/<pid>/cmdline is NUL-delimited.
+adguard_active_config(){
+    local pid="$1"
+    [ -r "$ADGUARD_PROC_ROOT/$pid/cmdline" ] || return 1
+    tr '\000' '\n' < "$ADGUARD_PROC_ROOT/$pid/cmdline" 2>/dev/null | awk '
+        previous == "-c" { print; exit }
+        /^-c=/ { sub(/^-c=/, ""); print; exit }
+        { previous=$0 }'
+}
+
+# Produce an AGH configuration whose ordinary upstream is dnsmasq. Existing
+# domain-specific rules are retained and loopback targets in upstream lists
+# follow the effective dnsmasq port. Bootstrap and fallback resolvers are not
+# touched.
+render_adguard_dns_config(){
+    local config="$1" port="$2"
+    awk -v port="$port" '
+        function desired_value() { return "127.0.0.1:" port }
+        function desired() { return "    - " desired_value() }
+        function loopback_port(line) {
+            gsub(/127\.0\.0\.1:[0-9][0-9]*/, "127.0.0.1:" port, line)
+            gsub(/\[::\]:[0-9][0-9]*/, "[::]:" port, line)
+            return line
+        }
+        function finish_upstream() {
+            if (in_upstream && !ordinary_written) print desired()
+            in_upstream=0
+        }
+        function add_missing_upstream() {
+            if (in_dns && !upstream_seen) {
+                print "  upstream_dns:"
+                print desired()
+                upstream_seen=1
+            }
+        }
+        /^dns:[[:space:]]*$/ {
+            in_dns=1
+            upstream_seen=0
+            print
+            next
+        }
+        in_dns && /^[^[:space:]#]/ {
+            finish_upstream()
+            add_missing_upstream()
+            in_dns=0
+            in_local_ptr=0
+            print
+            next
+        }
+        in_upstream && /^  [A-Za-z0-9_]+:/ {
+            finish_upstream()
+        }
+        in_local_ptr && /^  [A-Za-z0-9_]+:/ {
+            in_local_ptr=0
+        }
+        in_dns && /^  upstream_dns:[[:space:]]*/ {
+            upstream_seen=1
+            ordinary_written=0
+            value=$0
+            sub(/^  upstream_dns:[[:space:]]*/, "", value)
+            if (value != "") {
+                compact=value
+                gsub(/[[:space:]]/, "", compact)
+                if (compact == "[" desired_value() "]" ||
+                    compact == "[\"" desired_value() "\"]" ||
+                    compact == "[\047" desired_value() "\047]") {
+                    print
+                } else {
+                    print "  upstream_dns:"
+                    print desired()
+                }
+                ordinary_written=1
+                in_upstream=0
+            } else {
+                print
+                in_upstream=1
+            }
+            next
+        }
+        in_dns && /^  upstream_dns_file:/ {
+            file_value=$0
+            sub(/^  upstream_dns_file:[[:space:]]*/, "", file_value)
+            if (file_value == "" || file_value == "\"\"" ||
+                file_value == "\047\047" || file_value == "null" || file_value == "~") {
+                print
+            } else {
+                print "  upstream_dns_file: \"\""
+            }
+            next
+        }
+        in_dns && /^  local_ptr_upstreams:[[:space:]]*$/ {
+            in_local_ptr=1
+            print
+            next
+        }
+        in_upstream && /^[[:space:]]*-[[:space:]]*/ {
+            item=$0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+            gsub(/^[\047\"]|[\047\"]$/, "", item)
+            # AGH domain-routed upstreams begin with [/.../] or [//].
+            if (item ~ /^\[\//) {
+                print loopback_port($0)
+            } else if (!ordinary_written) {
+                if (item == desired_value()) print
+                else print desired()
+                ordinary_written=1
+            }
+            next
+        }
+        in_local_ptr && /^[[:space:]]*-[[:space:]]*/ {
+            print loopback_port($0)
+            next
+        }
+        { print }
+        END {
+            finish_upstream()
+            add_missing_upstream()
+        }
+    ' "$config"
+}
+
+wait_for_adguard_dns(){
+    local max="${1:-15}" i=0
+    while [ "$i" -lt "$max" ]; do
+        [ -n "$(adguard_dns_pid)" ] && dnsmasq_listener_ready && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Keep AGH -> dnsmasq integration correct without restarting either service
+# when the active configuration already matches. Any failed change is rolled
+# back before returning an error.
+ensure_adguard_dns(){
+    local pid config port candidate backup
+    pid=$(adguard_dns_pid) || return 0
+    [ -n "$pid" ] || return 0
+
+    config=$(adguard_active_config "$pid") || {
+        log_msg "ERROR: AdGuard Home owns port 53 but its active config path is unavailable"
+        return 1
+    }
+    [ -f "$config" ] && [ -r "$config" ] && [ -w "$config" ] || {
+        log_msg "ERROR: AdGuard Home active config is not a writable file"
+        return 1
+    }
+    port=$(dnsmasq_listen_port) || {
+        log_msg "ERROR: Cannot determine the dnsmasq listener port for AdGuard Home"
+        return 1
+    }
+    if [ "$port" = 53 ]; then
+        log_msg "ERROR: AdGuard Home owns port 53 but dnsmasq also declares port 53"
+        return 1
+    fi
+
+    candidate=$(mktemp /tmp/awg_agh_config.XXXXXX) || return 1
+    backup=$(mktemp /tmp/awg_agh_backup.XXXXXX) || { rm -f "$candidate"; return 1; }
+    if ! render_adguard_dns_config "$config" "$port" > "$candidate" || [ ! -s "$candidate" ]; then
+        log_msg "ERROR: Cannot prepare AdGuard Home DNS configuration"
+        rm -f "$candidate" "$backup"
+        return 1
+    fi
+    if cmp -s "$config" "$candidate"; then
+        rm -f "$candidate" "$backup"
+        return 0
+    fi
+    [ -x "$ADGUARD_INIT" ] || {
+        log_msg "ERROR: AdGuard Home init script is unavailable"
+        rm -f "$candidate" "$backup"
+        return 1
+    }
+    cp "$config" "$backup" || { rm -f "$candidate" "$backup"; return 1; }
+
+    if ! "$ADGUARD_INIT" stop >/dev/null 2>&1 || ! wait_for_pid_exit AdGuardHome 15; then
+        log_msg "ERROR: AdGuard Home did not stop; DNS configuration retained"
+        [ -n "$(adguard_dns_pid)" ] || "$ADGUARD_INIT" start >/dev/null 2>&1
+        rm -f "$candidate" "$backup"
+        return 1
+    fi
+
+    if cp "$candidate" "$config" && "$ADGUARD_INIT" start >/dev/null 2>&1 && wait_for_adguard_dns 20; then
+        log_msg "AdGuard Home upstream set to 127.0.0.1:$port"
+        rm -f "$candidate" "$backup"
+        return 0
+    fi
+
+    "$ADGUARD_INIT" stop >/dev/null 2>&1
+    wait_for_pid_exit AdGuardHome 10
+    local restored=0
+    cp "$backup" "$config" && restored=1
+    "$ADGUARD_INIT" start >/dev/null 2>&1
+    if [ "$restored" = 1 ] && wait_for_adguard_dns 20; then
+        log_msg "ERROR: AdGuard Home update failed; previous configuration restored"
+    else
+        log_msg "ERROR: AdGuard Home update failed and recovery was not verified"
+    fi
+    rm -f "$candidate" "$backup"
     return 1
 }
 
@@ -971,6 +1186,7 @@ setup_firewall_body(){
     # --- Restart dnsmasq if geo active ---
     if true; then
         restart_dnsmasq_and_wait 15 || return 1
+        ensure_adguard_dns || return 1
     fi
 
     # Existing unrelated sessions are retained. Selective invalidation only.
@@ -1222,6 +1438,7 @@ do_start(){
 
     if is_running; then
         log_msg "Already running"
+        ensure_adguard_dns || return 1
         ensure_ui_mark_nat || return 1
         repair_aux_routing || return 1
         register_managed_cron
@@ -1420,6 +1637,8 @@ do_install_page(){
         register_managed_cron
     fi
 
+    ensure_adguard_dns || return 1
+
     ensure_status_loop
     update_status
     do_mount_ui || return 1
@@ -1518,6 +1737,8 @@ do_watchdog(){
             return 1
         fi
     fi
+
+    ensure_adguard_dns || return 1
 
     ensure_status_loop
     # Firmware can reset rp_filter and awg0 recreation removes table 400.
