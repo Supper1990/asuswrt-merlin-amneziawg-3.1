@@ -24,8 +24,10 @@ class Recovery(unittest.TestCase):
             lock = Path(d) / 'lock'
             lock.mkdir()
             (lock / 'pid').write_text('2147483647')
-            r = self.run_shell(functions(MAIN, 'acquire_lock', 'release_lock') +
-                               '\nacquire_lock || exit 1\nrelease_lock\n', {'LOCKDIR': str(lock)})
+            r = self.run_shell(functions(MAIN, 'process_start_time', 'lock_owner_active',
+                                         'acquire_lock', 'release_lock') +
+                               '\nprocess_start_time(){ echo 123; }\nacquire_lock || exit 1\nrelease_lock\n',
+                               {'LOCKDIR': str(lock)})
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse(lock.exists())
 
@@ -34,11 +36,38 @@ class Recovery(unittest.TestCase):
             lock = Path(d) / 'lock'
             lock.mkdir()
             (lock / 'pid').write_text(str(os.getpid()))
-            r = self.run_shell(functions(MAIN, 'acquire_lock') +
+            r = self.run_shell(functions(MAIN, 'process_start_time', 'lock_owner_active',
+                                         'acquire_lock') +
                                '\nsleep(){ :; }\nlog_msg(){ :; }\nacquire_lock\n',
                                {'LOCKDIR': str(lock)})
             self.assertNotEqual(r.returncode, 0)
             self.assertEqual((lock / 'pid').read_text(), str(os.getpid()))
+
+    def test_reused_pid_lock_is_recovered(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / 'lock'
+            lock.mkdir()
+            (lock / 'pid').write_text(str(os.getpid()))
+            (lock / 'start').write_text('0')
+            r = self.run_shell(functions(MAIN, 'process_start_time', 'lock_owner_active',
+                                         'acquire_lock', 'release_lock') +
+                               '\nprocess_start_time(){ echo 123; }\nacquire_lock || exit 1\nrelease_lock\n',
+                               {'LOCKDIR': str(lock)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(lock.exists())
+
+    def test_lock_timeout_reports_path_and_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / 'lock'
+            lock.mkdir()
+            (lock / 'pid').write_text(str(os.getpid()))
+            r = self.run_shell(functions(MAIN, 'process_start_time', 'lock_owner_active',
+                                         'acquire_lock') +
+                               '\nsleep(){ :; }\nlog_msg(){ echo "$*"; }\nacquire_lock\n',
+                               {'LOCKDIR': str(lock)})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(f'path={lock}', r.stdout)
+            self.assertIn(f'owner_pid={os.getpid()}', r.stdout)
 
     def test_deferred_firewall_replay_keeps_dispatch_lock(self):
         with tempfile.TemporaryDirectory() as d:

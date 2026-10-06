@@ -594,14 +594,37 @@ wait_for_iface(){
     return 1
 }
 
+process_start_time(){
+    [ -r "/proc/$1/stat" ] || return 1
+    awk '{
+        sub(/^.*\) /, "")
+        print $20
+        exit
+    }' "/proc/$1/stat" 2>/dev/null
+}
+
+lock_owner_active(){
+    local owner_pid="$1" saved_start current_start
+    case "$owner_pid" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$owner_pid" 2>/dev/null || return 1
+
+    # Locks created by older releases have no start-time file. Keep treating
+    # a live PID as their owner, but verify new locks against PID reuse.
+    [ -f "$LOCKDIR/start" ] || return 0
+    saved_start=$(cat "$LOCKDIR/start" 2>/dev/null)
+    current_start=$(process_start_time "$owner_pid") || return 1
+    [ -n "$saved_start" ] && [ "$saved_start" = "$current_start" ]
+}
+
 acquire_lock(){
     [ "${DISPATCH_LOCK:-0}" = "1" ] && return 0
-    local tries=0
+    local tries=0 old_pid="" owner_start=""
     while ! mkdir "$LOCKDIR" 2>/dev/null; do
         if [ -f "$LOCKDIR/pid" ]; then
-            local old_pid
             old_pid=$(cat "$LOCKDIR/pid" 2>/dev/null)
-            if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+            if ! lock_owner_active "$old_pid"; then
                 rm -rf "$LOCKDIR"
                 continue
             fi
@@ -609,10 +632,16 @@ acquire_lock(){
             rmdir "$LOCKDIR" 2>/dev/null && continue
         fi
         tries=$((tries + 1))
-        [ $tries -ge 30 ] && { log_msg "ERROR: lock timeout"; return 1; }
+        if [ $tries -ge 30 ]; then
+            log_msg "ERROR: lock timeout: path=$LOCKDIR owner_pid=${old_pid:-unknown}"
+            return 1
+        fi
         sleep 1
     done
-    echo $$ > "$LOCKDIR/pid"
+    echo $$ > "$LOCKDIR/pid" || { rm -rf "$LOCKDIR"; return 1; }
+    owner_start=$(process_start_time $$) || { rm -rf "$LOCKDIR"; return 1; }
+    [ -n "$owner_start" ] || { rm -rf "$LOCKDIR"; return 1; }
+    echo "$owner_start" > "$LOCKDIR/start" || { rm -rf "$LOCKDIR"; return 1; }
 }
 
 release_lock(){
@@ -1673,10 +1702,11 @@ do_install_page(){
 do_mount_ui(){
     (
         # UI work must not wait behind tunnel setup or rebuilding AntiFilter.
-        # This cron also operates when the tunnel is deliberately stopped.
+        # Keep a low-frequency recovery job only until the page is mounted.
+        # It also operates when the tunnel is deliberately stopped.
         [ -s "$ADDON_DIR/amneziawg_page.asp" ] || exit 1
         if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then exit 1; fi
-        cru a awg_ui_watchdog "* * * * * '$ADDON_DIR/amneziawg.sh' mount_ui" || exit 1
+        cru a awg_ui_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' mount_ui" || exit 1
         LOCKDIR="$UI_LOCKDIR"
         DISPATCH_LOCK=0
         acquire_lock || exit 1
@@ -1687,6 +1717,7 @@ do_mount_ui(){
             if ui_mount_once; then
                 [ ! -f "$GEO_DIR/v2fly_categories.txt" ] || cp "$GEO_DIR/v2fly_categories.txt" "$UI_WEB_DIR/v2fly_categories.htm"
                 ensure_status_loop
+                cru d awg_ui_watchdog 2>/dev/null
                 exit 0
             fi
             attempt=$((attempt+1))

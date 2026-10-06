@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from test_recovery import functions, ROOT
 MAIN=(ROOT/'addon/amneziawg.sh').read_text()
-UI_FUNCTIONS=functions(MAIN,'mount_menu_tree','ui_ready','ui_mount_once','do_mount_ui','acquire_lock','release_lock')
+UI_FUNCTIONS=functions(MAIN,'mount_menu_tree','ui_ready','ui_mount_once','do_mount_ui',
+                       'process_start_time','lock_owner_active','acquire_lock','release_lock')
 
 class UIBoot(unittest.TestCase):
     def fixture(self, d):
@@ -25,6 +26,7 @@ class UIBoot(unittest.TestCase):
 package_busy(){ return 1; }
 log_msg(){ printf '%s\\n' "$*" >> "$TRACE"; }
 cru(){ printf 'cron %s\\n' "$*" >> "$TRACE"; }
+process_start_time(){ echo 123; }
 ensure_status_loop(){ :; }
 do_start(){ echo UNEXPECTED_START >> "$TRACE"; return 1; }
 umount(){ :; }
@@ -43,7 +45,9 @@ mount(){ printf 'mount\\n' >> "$TRACE"; cp "$3" "$4"; }
             self.assertFalse(Path(d,'ui-lock').exists())
             trace=Path(d,'trace').read_text()
             self.assertNotIn('UNEXPECTED_START',trace)
-            self.assertIn('awg_ui_watchdog',trace)
+            self.assertIn("cron a awg_ui_watchdog */5 * * * *",trace)
+            self.assertIn('cron d awg_ui_watchdog',trace)
+            self.assertNotIn("cron a awg_ui_watchdog * * * * *",trace)
             self.assertIn('Other addon',Path(d,'menu').read_text())
 
     def test_repeated_mount_reuses_page_and_does_not_rebind(self):
@@ -88,7 +92,10 @@ do_mount_ui
             self.assertEqual(Path(d,'menu').read_text(),'Other addon menu without expected anchor\n')
             self.assertTrue(Path(d,'web/user3.asp').exists())
             self.assertNotIn('mount\n',Path(d,'trace').read_text())
-            self.assertIn('UI watchdog will retry',Path(d,'trace').read_text())
+            trace=Path(d,'trace').read_text()
+            self.assertIn('UI watchdog will retry',trace)
+            self.assertIn("cron a awg_ui_watchdog */5 * * * *",trace)
+            self.assertNotIn('cron d awg_ui_watchdog',trace)
 
     def test_failed_bind_restores_previous_menu(self):
         with tempfile.TemporaryDirectory() as d:
