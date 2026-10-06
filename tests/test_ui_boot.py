@@ -45,9 +45,8 @@ mount(){ printf 'mount\\n' >> "$TRACE"; cp "$3" "$4"; }
             self.assertFalse(Path(d,'ui-lock').exists())
             trace=Path(d,'trace').read_text()
             self.assertNotIn('UNEXPECTED_START',trace)
-            self.assertIn("cron a awg_ui_watchdog */5 * * * *",trace)
             self.assertIn('cron d awg_ui_watchdog',trace)
-            self.assertNotIn("cron a awg_ui_watchdog * * * * *",trace)
+            self.assertNotIn('cron a awg_ui_watchdog',trace)
             self.assertIn('Other addon',Path(d,'menu').read_text())
 
     def test_repeated_mount_reuses_page_and_does_not_rebind(self):
@@ -93,9 +92,9 @@ do_mount_ui
             self.assertTrue(Path(d,'web/user3.asp').exists())
             self.assertNotIn('mount\n',Path(d,'trace').read_text())
             trace=Path(d,'trace').read_text()
-            self.assertIn('UI watchdog will retry',trace)
-            self.assertIn("cron a awg_ui_watchdog */5 * * * *",trace)
-            self.assertNotIn('cron d awg_ui_watchdog',trace)
+            self.assertIn('retry on next boot, update, or manual mount_ui',trace)
+            self.assertIn('cron d awg_ui_watchdog',trace)
+            self.assertNotIn('cron a awg_ui_watchdog',trace)
 
     def test_failed_bind_restores_previous_menu(self):
         with tempfile.TemporaryDirectory() as d:

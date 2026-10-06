@@ -1702,11 +1702,11 @@ do_install_page(){
 do_mount_ui(){
     (
         # UI work must not wait behind tunnel setup or rebuilding AntiFilter.
-        # Keep a low-frequency recovery job only until the page is mounted.
-        # It also operates when the tunnel is deliberately stopped.
+        # Remove the legacy periodic UI job. Boot and package hooks invoke this
+        # bounded retry loop directly; tunnel operation does not depend on it.
+        cru d awg_ui_watchdog 2>/dev/null
         [ -s "$ADDON_DIR/amneziawg_page.asp" ] || exit 1
         if package_busy && [ "${AWG_PACKAGE_CHILD:-0}" != 1 ]; then exit 1; fi
-        cru a awg_ui_watchdog "*/5 * * * * '$ADDON_DIR/amneziawg.sh' mount_ui" || exit 1
         LOCKDIR="$UI_LOCKDIR"
         DISPATCH_LOCK=0
         acquire_lock || exit 1
@@ -1717,13 +1717,12 @@ do_mount_ui(){
             if ui_mount_once; then
                 [ ! -f "$GEO_DIR/v2fly_categories.txt" ] || cp "$GEO_DIR/v2fly_categories.txt" "$UI_WEB_DIR/v2fly_categories.htm"
                 ensure_status_loop
-                cru d awg_ui_watchdog 2>/dev/null
                 exit 0
             fi
             attempt=$((attempt+1))
             [ "$attempt" -ge 12 ] || sleep 5
         done
-        log_msg 'ERROR: Web UI not ready; UI watchdog will retry'
+        log_msg 'ERROR: Web UI not ready; retry on next boot, update, or manual mount_ui'
         exit 1
     )
 }
