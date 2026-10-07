@@ -37,5 +37,8 @@ set_members(){
 }
 
 valid_geosite_name(){
-    printf '%s\n' "$1" | grep -qE '^[a-z0-9][a-z0-9._-]*(@[a-z0-9][a-z0-9._-]*)?$'
+    # Upstream list names can contain a literal !, for example
+    # category-ai-!cn and geolocation-!cn.  It is safe in the base name;
+    # keep attribute syntax restricted to the existing character set.
+    printf '%s\n' "$1" | grep -qE '^[a-z0-9][a-z0-9._!-]*(@[a-z0-9][a-z0-9._-]*)?$'
 }

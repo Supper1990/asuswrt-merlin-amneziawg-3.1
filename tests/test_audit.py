@@ -45,7 +45,16 @@ download_geoip_service test
             self.assertEqual(cache.read_text(),'8.8.8.0/24\n')
 
     def test_geosite_attribute_syntax(self):
-        for value, valid in [('google@cn', True), ('openai', True), ('../../tmp', False), ('openai@', False)]:
+        for value, valid in [
+            ('google@cn', True),
+            ('openai', True),
+            ('category-ai-!cn', True),
+            ('geolocation-!cn', True),
+            ('!cn', False),
+            ('../../tmp', False),
+            ('openai@', False),
+            ('openai@!cn', False),
+        ]:
             result=self.shell(COMMON+'\nvalid_geosite_name "$VALUE"', {'VALUE':value})
             self.assertEqual(result.returncode==0,valid)
 
