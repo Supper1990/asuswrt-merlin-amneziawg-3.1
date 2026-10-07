@@ -50,13 +50,76 @@ download_geoip_service test
             ('openai', True),
             ('category-ai-!cn', True),
             ('geolocation-!cn', True),
+            ('jd@!cn', True),
             ('!cn', False),
             ('../../tmp', False),
             ('openai@', False),
-            ('openai@!cn', False),
+            ('openai@-cn', False),
         ]:
             result=self.shell(COMMON+'\nvalid_geosite_name "$VALUE"', {'VALUE':value})
             self.assertEqual(result.returncode==0,valid)
+
+    def test_geosite_flattened_include_and_exact_attribute(self):
+        source='''lists:
+  - name: "child"
+    length: 1
+    rules:
+      - "domain:included.example"
+  - name: "parent"
+    length: 5
+    rules:
+      - "domain:included.example"
+      - "domain:multi.example:@ads,@cn"
+      - "domain:prefix.example:@cnx"
+      - "domain:negative.example:@!cn"
+      - "full:full.example:@cn"
+'''
+        with tempfile.TemporaryDirectory() as d:
+            Path(d,'source.yml').write_text(source)
+            body=functions(MAIN,'extract_geosite_category')+'\nextract_geosite_category "$SELECT" "$D/source.yml" "$D/out" "$D/warnings"'
+
+            result=self.shell(body,{'D':d,'SELECT':'parent'})
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(Path(d,'out').read_text().splitlines(),[
+                'included.example','multi.example','prefix.example','negative.example','full.example'])
+
+            result=self.shell(body,{'D':d,'SELECT':'parent@cn'})
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(Path(d,'out').read_text().splitlines(),['multi.example','full.example'])
+
+            result=self.shell(body,{'D':d,'SELECT':'parent@!cn'})
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(Path(d,'out').read_text().splitlines(),['negative.example'])
+
+    def test_geosite_unresolved_include_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d,'source.yml').write_text('''lists:
+  - name: "parent"
+    length: 1
+    rules:
+      - "include:child"
+''')
+            result=self.shell(functions(MAIN,'extract_geosite_category')+'''\n
+extract_geosite_category parent "$D/source.yml" "$D/out" "$D/warnings"
+''',{'D':d})
+            self.assertNotEqual(result.returncode,0,result.stderr)
+            self.assertIn('unexpected unresolved include:child',Path(d,'warnings').read_text())
+
+    def test_geoip_autocomplete_matches_upstream_catalog(self):
+        special_match=re.search(r"var v2flyIpSpecialList = \[(.*?)\];",UI)
+        country_match=re.search(r"var v2flyIpCountryList = '([^']+)'\.split\(' '\);",UI)
+        self.assertIsNotNone(special_match)
+        self.assertIsNotNone(country_match)
+        specials=re.findall(r"'([^']+)'",special_match.group(1))
+        countries=country_match.group(1).split()
+        categories=specials+countries
+        self.assertEqual(len(specials),10)
+        self.assertEqual(len(countries),250)
+        self.assertEqual(len(categories),len(set(categories)))
+        for value in ('ru','us','xk','telegram','tor','private'):
+            self.assertIn(value,categories)
+        for value in ('apple','amazon','microsoft','github','stripe','openai'):
+            self.assertNotIn(value,categories)
 
     def test_json_backslash_and_controls(self):
         text='VPN \\ foo "quoted"\nnext\ttab\rreturn'

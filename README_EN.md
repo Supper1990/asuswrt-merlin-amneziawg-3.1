@@ -158,6 +158,7 @@ Run an update manually:
 GeoIP provides routing by IP addresses and CIDR networks.
 
 You can use predefined lists and add your own addresses and networks through **Custom IPs**.
+Autocomplete contains 260 Loyalsoldier categories: 250 country and territory codes and 10 special lists, including `tor` and `private`. Only selected categories are downloaded; new category names may be entered manually.
 Only categories selected in **GeoIP Service Lists** are loaded into `awg_dst`. Clicking **Apply** removes deselected categories without requiring a separate list update, and the removal result is written to the log. GeoSite categories are parsed from the current `dlc.dat_plain.yml` format, and clearing GeoSite or Custom Domains no longer leaves stale rules behind.
 
 After settings are applied, GeoSite domain pre-resolution runs in the background. The web interface does not wait for every DNS request to finish; the start and completion of the `awg_dst` prefill are shown in the log.
@@ -174,6 +175,7 @@ Example:
 GeoSite provides routing by domain lists.
 
 Domain rules are processed using integration with `dnsmasq` and `ipset`.
+The addon uses compiled `dlc.dat_plain.yml`: v2fly expands nested `include:` directives before export. Selectors such as `google@cn` and `jd@!cn` match an exact attribute at any position in the attribute list. `!cn` is a distinct upstream label, not automatic negation of `cn`. An unexpected unresolved `include:` causes Apply to fail. `keyword` and `regexp` rules are skipped with warnings; `full` rules also cover subdomains in dnsmasq.
 
 For domain routing to work correctly, client devices must use the router as their DNS server.
 

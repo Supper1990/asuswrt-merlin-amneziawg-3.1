@@ -949,6 +949,70 @@ cleanup_firewall(){
     log_msg "Firewall rules cleaned"
 }
 
+# dlc.dat_plain.yml is exported from the compiled dlc.dat, so upstream
+# include: directives have already been expanded.  Extract supported domain
+# rules from one flattened category and apply an optional exact @attribute
+# selector.  Warn if a future upstream format unexpectedly exposes an
+# unresolved include instead of silently producing an incomplete list.
+extract_geosite_category(){
+    local selection="$1" source="$2" output="$3" warnings="$4"
+    [ -f "$source" ] || return 1
+    awk -v selection="$selection" -v warnings="$warnings" '
+        function has_attr(value, wanted, field_count, fields, attr_count, attrs, i) {
+            field_count=split(value, fields, ":")
+            if (field_count < 3) return 0
+            attr_count=split(fields[field_count], attrs, ",")
+            for (i=1; i<=attr_count; i++) {
+                if (attrs[i] == "@" wanted) return 1
+            }
+            return 0
+        }
+        BEGIN {
+            split(selection, selected, "@")
+            category=selected[1]
+            attribute=selected[2]
+            category_seen=0
+        }
+        /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
+            name=$0
+            sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name)
+            sub(/^"/, "", name)
+            sub(/"[[:space:]]*$/, "", name)
+            found=(name == category)
+            if (found) category_seen=1
+            next
+        }
+        found && /^[[:space:]]*-[[:space:]]*/ {
+            rule=$0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", rule)
+            sub(/^"/, "", rule)
+            sub(/"[[:space:]]*$/, "", rule)
+            if (rule ~ /^include:/) {
+                print category ": unexpected unresolved " rule >> warnings
+                unresolved_include=1
+                next
+            }
+            if (attribute != "" && !has_attr(rule, attribute)) next
+            if (rule ~ /^(keyword|regexp):/) {
+                print category ": unsupported " rule >> warnings
+                next
+            }
+            if (rule ~ /^full:/) {
+                print category ": full domain includes subdomains in dnsmasq: " rule >> warnings
+            }
+            if (rule ~ /^(domain|full):/) {
+                sub(/^[^:]*:/, "", rule)
+                sub(/:@.*/, "", rule)
+                if (rule != "") print rule
+            }
+        }
+        END {
+            if (!category_seen) exit 2
+            if (unresolved_include) exit 3
+        }
+    ' "$source" > "$output"
+}
+
 setup_firewall_body(){
     local previous_dns="${1:-}" previous_include="${2:-}"
     cleanup_firewall || return 1
@@ -1003,29 +1067,12 @@ setup_firewall_body(){
                 log_msg "WARNING: Invalid GeoSite category: $svc"
                 continue
             }
-            awk -v cat="$svc" -v warnings="$GEO_DIR/domains/warnings.txt" '
-                BEGIN{split(cat,sel,"@");cat=sel[1];attr=sel[2]}
-                /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
-                    name=$0
-                    sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", name)
-                    sub(/^"/, "", name); sub(/"[[:space:]]*$/, "", name)
-                    found=(name==cat)
-                    next
-                }
-                found && /^[[:space:]]*-[[:space:]]*/ {
-                    rule=$0
-                    sub(/^[[:space:]]*-[[:space:]]*/, "", rule)
-                    sub(/^"/, "", rule); sub(/"[[:space:]]*$/, "", rule)
-                    if (attr!="" && index(rule, ":@" attr)==0)next
-                    if (rule ~ /^(keyword|regexp):/) {print cat ": unsupported " rule >> warnings; next}
-                    if (rule ~ /^full:/) {print cat ": full domain includes subdomains in dnsmasq: " rule >> warnings}
-                    if (rule ~ /^(domain|full):/) {
-                        sub(/^[^:]*:/, "", rule)
-                        sub(/:@.*/, "", rule)
-                        if (rule != "") print rule
-                    }
-                }
-            ' "$GEO_DIR/v2fly_all.yml" > "$GEO_DIR/domains/v2fly_${svc}.txt"
+            if ! extract_geosite_category "$svc" "$GEO_DIR/v2fly_all.yml" \
+                "$GEO_DIR/domains/v2fly_${svc}.txt" "$GEO_DIR/domains/warnings.txt"; then
+                rm -f "$GEO_DIR/domains/v2fly_${svc}.txt"
+                log_msg "ERROR: GeoSite category extraction failed: $svc"
+                return 1
+            fi
             if [ ! -s "$GEO_DIR/domains/v2fly_${svc}.txt" ]; then
                 rm -f "$GEO_DIR/domains/v2fly_${svc}.txt"
                 log_msg "WARNING: GeoSite category empty or not found: $svc"
