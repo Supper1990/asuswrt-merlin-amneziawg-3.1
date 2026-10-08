@@ -380,3 +380,11 @@ The periodic `awg_ui_watchdog` job has been removed completely and is no longer 
 ### 2.2.0-34 — GeoSite categories containing `!`
 
 GeoSite name validation now accepts standard v2fly list names containing `!` in the base name, including `category-ai-!cn` and `geolocation-!cn`. Restrictions on attributes following `@`, paths and other invalid characters remain in place. Regression tests cover both accepted and rejected forms. AmneziaWG binaries are unchanged from 2.2.0-33. Version 2.2.0-34 has not yet been validated on Merlin or ARMv7 hardware.
+
+### 2.2.0-35 — GeoIP catalogue and exact GeoSite attributes
+
+GeoIP suggestions now contain 260 categories: 250 country codes and 10 special Loyalsoldier lists. Only selected categories are downloaded; safe names of future categories may still be entered manually.
+
+GeoSite now matches attributes exactly in every tag position: `@cn` does not match `@cnx`. `@!cn` is supported as a separate literal tag, not a negation of `@cn`. The v2fly generator expands `include` directives before exporting the YAML used by the addon. An unexpected remaining `include:` in a selected category aborts Apply with diagnostics rather than producing an incomplete list. Existing conversion limitations for `full`, `keyword` and `regexp` remain documented above.
+
+All 81 local tests passed. Binaries and memory settings are unchanged. These changes have not yet been validated on Merlin or ARMv7 hardware.
