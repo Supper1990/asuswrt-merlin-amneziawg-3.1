@@ -226,11 +226,31 @@ find_external_program(){
 
 # The firmware can flush tables while our dispatcher lock defers its hook.
 # Recover inside the same Apply transaction before do_start tears down awg0.
-# Retry only with an observed firewall event; real failures still roll back.
+# The hook may arrive after the flush has already failed verification. Wait
+# briefly for that event before rolling back; never rebuild without an event.
 verify_firewall_after_events(){
-    local retry_dir="$1" attempt=0
+    local retry_dir="$1" attempt=0 waited
     while ! main_firewall_base_healthy; do
-        if [ ! -f "$FIREWALL_PENDING" ] || [ "$attempt" -ge 2 ]; then
+        # Trace only the read-only health probe, never tunnel configuration or
+        # settings generation. Retain the latest failed Apply for diagnosis.
+        (
+            umask 077
+            ( set -x; main_firewall_base_healthy ) > /tmp/awg-firewall-verification.log 2>&1
+        )
+        if [ "$attempt" -ge 2 ]; then
+            log_msg 'ERROR: firewall verification did not pass'
+            return 1
+        fi
+        if [ ! -f "$FIREWALL_PENDING" ]; then
+            log_msg 'Firewall verification failed; waiting for deferred event (up to 5s)'
+            waited=0
+            while [ ! -f "$FIREWALL_PENDING" ] && [ "$waited" -lt 5 ]; do
+                sleep 1
+                waited=$((waited+1))
+                main_firewall_base_healthy && return 0
+            done
+        fi
+        if [ ! -f "$FIREWALL_PENDING" ]; then
             log_msg 'ERROR: firewall verification did not pass'
             return 1
         fi

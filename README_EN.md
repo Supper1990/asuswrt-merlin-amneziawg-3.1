@@ -396,3 +396,13 @@ When firewall verification after Apply fails and a deferred `firewall_restart` i
 User-provided RT-AX88U Pro / Merlin 3006.102.8_4 boot logs showed verification failing with a deferred event, one rebuild restoring the rules, and a successful tunnel start. Subsequent checks showed the preserved `AWG_OUTPUT` hook, recent handshakes and traffic. After a separate DNS-check fix in the user's zapret profile, both sets of rules were present and packets reached NFQUEUE 299. That zapret fix is not part of the AWG package; another boot with the corrected zapret profile remains untested.
 
 Seven firewall-event regression tests were added. AmneziaWG binaries and memory settings are unchanged. ARMv7 device operation remains unverified.
+
+### 2.2.0-37 — wait for a late firewall event
+
+After a failed firewall health check, the addon waits up to five seconds for a deferred `firewall_restart`, checking health once per second. This covers a flush that precedes registration of the firmware hook. Rebuilds still require an observed event and remain limited to two; setup errors and an absent event after the wait retain rollback. A health check that recovers without an event does not trigger a rebuild.
+
+A failed check captures its diagnostic trace in `/tmp/awg-firewall-verification.log`. Only rule, ipset and route checks are traced; tunnel configuration generation is not traced.
+
+The change follows a user-provided RT-AX88U Pro / Merlin 3006.102.8_4 boot log for 2.2.0-36 in which verification failed and rollback began before a deferred-event message. This is consistent with a late hook, but the log does not identify the failed health predicate. A manual start with the new runtime succeeded, with a handshake and `Tunnel verified: traffic passing`. The manual start did not exercise the event wait; reboot autostart with this fix and ARMv7 device operation remain unverified.
+
+Four regression scenarios were added: a delayed first event, an event at the last wait, a delayed second event, and health recovery without an event. All 92 local tests pass. AmneziaWG binaries, memory settings and the zapret profile are unchanged from 2.2.0-36.
