@@ -388,3 +388,11 @@ GeoIP suggestions now contain 260 categories: 250 country codes and 10 special L
 GeoSite now matches attributes exactly in every tag position: `@cn` does not match `@cnx`. `@!cn` is supported as a separate literal tag, not a negation of `@cn`. The v2fly generator expands `include` directives before exporting the YAML used by the addon. An unexpected remaining `include:` in a selected category aborts Apply with diagnostics rather than producing an incomplete list. Existing conversion limitations for `full`, `keyword` and `regexp` remain documented above.
 
 All 81 local tests passed. Binaries and memory settings are unchanged. These changes have not yet been validated on Merlin or ARMv7 hardware.
+
+### 2.2.0-36 — firewall recovery during startup
+
+When firewall verification after Apply fails and a deferred `firewall_restart` is pending, rules are rebuilt inside the current transaction before the tunnel is stopped. Recovery allows at most two rebuilds; a missing event or a rebuild error retains rollback. Original rollback snapshots remain untouched. A retry compares DNS files with the latest active configuration so unchanged files and a ready listener do not trigger another dnsmasq restart.
+
+User-provided RT-AX88U Pro / Merlin 3006.102.8_4 boot logs showed verification failing with a deferred event, one rebuild restoring the rules, and a successful tunnel start. Subsequent checks showed the preserved `AWG_OUTPUT` hook, recent handshakes and traffic. After a separate DNS-check fix in the user's zapret profile, both sets of rules were present and packets reached NFQUEUE 299. That zapret fix is not part of the AWG package; another boot with the corrected zapret profile remains untested.
+
+Seven firewall-event regression tests were added. AmneziaWG binaries and memory settings are unchanged. ARMv7 device operation remains unverified.
