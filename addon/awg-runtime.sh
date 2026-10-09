@@ -224,6 +224,35 @@ find_external_program(){
     return 1
 }
 
+# The firmware can flush tables while our dispatcher lock defers its hook.
+# Recover inside the same Apply transaction before do_start tears down awg0.
+# Retry only with an observed firewall event; real failures still roll back.
+verify_firewall_after_events(){
+    local retry_dir="$1" attempt=0
+    while ! main_firewall_base_healthy; do
+        if [ ! -f "$FIREWALL_PENDING" ] || [ "$attempt" -ge 2 ]; then
+            log_msg 'ERROR: firewall verification did not pass'
+            return 1
+        fi
+        attempt=$((attempt+1))
+        rm -f "$FIREWALL_PENDING" || return 1
+        # Keep the original rollback snapshots intact. Compare the retry's
+        # generated DNS files with the most recently installed configuration
+        # so recovery does not force another unchanged dnsmasq restart.
+        rm -f "$retry_dir/retry_dns" "$retry_dir/retry_include" || return 1
+        if [ -f "$DNSMASQ_AWG_CONF" ]; then
+            cp "$DNSMASQ_AWG_CONF" "$retry_dir/retry_dns" || return 1
+        fi
+        if [ -f "$DNSMASQ_INCLUDE" ]; then
+            cp "$DNSMASQ_INCLUDE" "$retry_dir/retry_include" || return 1
+        fi
+        log_msg "Firewall verification failed with deferred event; rebuilding ($attempt/2)"
+        sleep 2
+        setup_firewall_body "$retry_dir/retry_dns" "$retry_dir/retry_include" || return 1
+    done
+    return 0
+}
+
 setup_firewall(){
     validate_runtime_settings || return 1
     cancel_prefill || return 1
@@ -267,7 +296,7 @@ setup_firewall(){
             return "$code"
         }
         setup_firewall_body "$txn/dns" "$txn/include" || { log_msg 'ERROR: firewall setup did not complete'; exit 1; }
-        main_firewall_base_healthy || { log_msg 'ERROR: firewall verification did not pass'; exit 1; }
+        verify_firewall_after_events "$txn" || exit 1
     )
     rc=$?
     if [ "$rc" != 0 ]; then
