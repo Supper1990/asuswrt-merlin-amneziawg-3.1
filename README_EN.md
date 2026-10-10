@@ -406,3 +406,11 @@ A failed check captures its diagnostic trace in `/tmp/awg-firewall-verification.
 The change follows a user-provided RT-AX88U Pro / Merlin 3006.102.8_4 boot log for 2.2.0-36 in which verification failed and rollback began before a deferred-event message. This is consistent with a late hook, but the log does not identify the failed health predicate. A manual start with the new runtime succeeded, with a handshake and `Tunnel verified: traffic passing`. The manual start did not exercise the event wait; reboot autostart with this fix and ARMv7 device operation remain unverified.
 
 Four regression scenarios were added: a delayed first event, an event at the last wait, a delayed second event, and health recovery without an event. All 92 local tests pass. AmneziaWG binaries, memory settings and the zapret profile are unchanged from 2.2.0-36.
+
+### 2.2.0-38 — share the direct routing rule with zapret
+
+The priority-9 `fwmark 0x101 → main` rule is retained during firewall cleanup because the zapret profile also uses it. Setup reuses a compatible rule and verifies the result if another process adds it concurrently. Incompatible rules, duplicates and failures without a valid rule still fail the operation. The shared rule is excluded from rollback replay.
+
+The user-provided 2.2.0-37 boot log showed a firewall rebuild failing to add this rule at 11:17:57, followed by tunnel shutdown. After installing the [patch](https://github.com/Supper1990/asuswrt-merlin-amneziawg-3.1/commit/403e4be9b6418893127b06c829b5527aa559d8a2) on RT-AX88U Pro / Merlin 3006.102.8_4, a manual restart and a subsequent reboot succeeded. In the October 10, 2026 log, startup completed at 11:36:07 and deferred firewall replay completed at 11:36:32. Snapshots at 11:37:15 and 11:40:55 showed the same PID, recent handshakes, increasing traffic and retained rules. These checks used patched scripts over the installed 2.2.0-37 package; installation of the final 2.2.0-38 IPK on hardware remains untested.
+
+Eight regression tests were added; all 100 local tests pass. AmneziaWG source versions, memory settings and the zapret profile are unchanged. ARMv7 hardware and long-term stability of this patch remain unverified. Deferred events still perform a full firewall rebuild.
