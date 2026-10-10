@@ -189,6 +189,7 @@ managed_firewall_rules
 get_setting(){ [ "$1" = awg_default_policy ] && echo vpn_all; }
 get_lan_net(){ echo 192.168.50.0/24; }
 get_endpoint(){ echo 203.0.113.1; }
+ensure_direct_rule(){ ip rule add fwmark "$DIRECT_MARK" lookup main prio 9; }
 ipset(){ [ "$1" = list ] && echo 'Number of entries: 0'; return 0; }
 ip(){ echo "$*" >> "$TRACE"; }
 iptables(){ echo "$*" >> "$TRACE"; }

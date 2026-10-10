@@ -224,6 +224,44 @@ find_external_program(){
     return 1
 }
 
+# Priority 9 is shared with the YouTube/zapret profile. Return 0 for the
+# exact unrestricted direct rule, 1 if absent, 2 for a conflict, 3 on read
+# failure. A partial mark mask or a source/interface restriction is not safe.
+direct_rule_state(){
+    local rules
+    rules=$(ip rule show 2>/dev/null) || return 3
+    printf '%s\n' "$rules" | awk -v mark="$DIRECT_MARK" '
+        $1=="9:" {
+            count++
+            if ($2=="from" && $3=="all" && $4=="fwmark" &&
+                ($5==mark || $5==mark "/0xffffffff") &&
+                $6=="lookup" && ($7=="main" || $7=="254") &&
+                (NF==7 || (NF==9 && $8=="proto"))) valid++
+        }
+        END { if (!count) exit 1; if (count==1 && valid==1) exit 0; exit 2 }
+    '
+}
+
+ensure_direct_rule(){
+    local state code detail direct_ip
+    direct_rule_state; state=$?
+    case "$state" in
+        0) return 0;;
+        1) ;;
+        2) log_msg 'ERROR: ip rule priority 9 is occupied by an incompatible or duplicate rule'; return 1;;
+        *) log_msg 'ERROR: cannot read ip rules for direct routing'; return 1;;
+    esac
+    direct_ip=${awg_ip_exec:-}
+    [ -n "$direct_ip" ] || direct_ip=$(find_external_program ip) || return 1
+    # Use the external binary so the transaction wrapper does not abort
+    # before we can check whether a concurrent profile installed this rule.
+    detail=$("$direct_ip" rule add fwmark "$DIRECT_MARK" lookup main prio 9 2>&1)
+    code=$?
+    direct_rule_state && return 0
+    log_msg "ERROR: direct ip rule not installed (exit $code): $detail"
+    return 1
+}
+
 # The firmware can flush tables while our dispatcher lock defers its hook.
 # Recover inside the same Apply transaction before do_start tears down awg0.
 # The hook may arrive after the flush has already failed verification. Wait
@@ -290,7 +328,9 @@ setup_firewall(){
     # Save the previous runtime before executing any destructive operation.
     iptables-save > "$txn/firewall" || { rm -rf "$txn"; return 1; }
     ip route show table "$RT_TABLE" > "$txn/routes" || { rm -rf "$txn"; return 1; }
-    ip rule show | awk '$0 ~ /lookup 300/ || $0 ~ /fwmark 0x101/ {print}' > "$txn/rules"
+    # The shared direct rule is retained by cleanup and must not be replayed
+    # from this snapshot, which could duplicate zapret's concurrent rule.
+    ip rule show | awk '$0 ~ /lookup 300/ {print}' > "$txn/rules"
     if ipset list "$IPSET_NAME" -t >/dev/null 2>&1; then
         ipset save "$IPSET_NAME" > "$txn/ipset" || { rm -rf "$txn"; return 1; }
         had_set=1

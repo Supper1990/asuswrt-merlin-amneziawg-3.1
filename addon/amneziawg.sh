@@ -242,7 +242,7 @@ main_firewall_base_healthy(){
         awk '/Number of entries/{print $NF}')
     [ -n "$current_ipset_count" ] || return 1
     [ "$current_ipset_count" -ge "$min_ipset_count" ] 2>/dev/null || return 1
-    ip rule show 2>/dev/null | grep -q "fwmark $DIRECT_MARK.*lookup main" || return 1
+    direct_rule_state || return 1
     ip rule show 2>/dev/null | grep -q "fwmark $FWMARK.*lookup $RT_TABLE" || return 1
     ip route show table $RT_TABLE 2>/dev/null | \
         grep -q "^0.0.0.0/1 dev $IFACE" || return 1
@@ -910,8 +910,9 @@ cleanup_firewall(){
     iptables -t mangle -F "$AWG_CHAIN" 2>/dev/null
     iptables -t mangle -X "$AWG_CHAIN" 2>/dev/null
 
-    # Remove our direct override and legacy source-only direct rules.
-    while ip rule del fwmark "$DIRECT_MARK" lookup main prio 9 2>/dev/null; do :; done
+    # Keep the shared priority-9 direct rule: zapret also needs it. Once our
+    # marking chains are gone it does not route any additional AWG traffic.
+    # Remove only the legacy source-only direct rules below.
     if [ -s "$CLIENTS_FILE" ]; then
         local old_dev old_name old_policy old_mac
         while IFS=',' read -r old_dev old_name old_policy old_mac; do
@@ -1269,7 +1270,7 @@ setup_firewall_body(){
         iptables -t mangle -A PREROUTING -j "$AWG_CHAIN"
 
     # --- Single fwmark rule for all marked traffic ---
-    ip rule add fwmark "$DIRECT_MARK" lookup main prio 9
+    ensure_direct_rule || return 1
     ip rule add fwmark "$FWMARK" lookup $RT_TABLE prio 98
 
     setup_router_geo || return 1
