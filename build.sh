@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-AWG_GO_TAG="${AWG_GO_TAG:-v3.1.20260828}"
+AWG_GO_TAG="${AWG_GO_TAG:-v3.1.20261116}"
 AWG_TOOLS_TAG="${AWG_TOOLS_TAG:-v3.1.20260812}"
 
 mkdir -p output

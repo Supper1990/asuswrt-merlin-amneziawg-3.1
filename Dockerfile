@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Reproducible userspace-only AWG 3.1 build for Asuswrt-Merlin ARM64.
 
-ARG AWG_GO_TAG=v3.1.20260828
+ARG AWG_GO_TAG=v3.1.20261116
 ARG AWG_TOOLS_TAG=v3.1.20260812
 
 FROM golang:1.25-bookworm AS go-builder
