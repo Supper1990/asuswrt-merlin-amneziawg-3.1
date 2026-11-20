@@ -9,6 +9,10 @@ ARG AWG_GO_TAG
 RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /build/amneziawg-go
 RUN curl -fsSL --retry 3 "https://codeload.github.com/amnezia-vpn/amneziawg-go/tar.gz/refs/tags/${AWG_GO_TAG}" | tar -xz --strip-components=1
+# Backport upstream PR 210. Stop on unfamiliar source rather than silently
+# building a new upstream tag without the dual-stack fix.
+COPY patches/amneziawg-go-ipv6-send.patch /tmp/ipv6-send.patch
+RUN git apply --reverse --check /tmp/ipv6-send.patch || git apply /tmp/ipv6-send.patch
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o /amneziawg-go-arm .
 
 FROM debian:bookworm AS tools-builder

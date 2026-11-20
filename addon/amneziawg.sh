@@ -209,6 +209,18 @@ restore_rp_filter(){
     done
 }
 
+# Match the same complete directive as the watchdog. Preserve the last
+# user directive/comment when dnsmasq.conf.add has no terminating newline.
+ensure_dns_include(){
+    local line="conf-file=$DNSMASQ_AWG_CONF" last
+    grep -qxF "$line" "$DNSMASQ_INCLUDE" 2>/dev/null && return 0
+    if [ -s "$DNSMASQ_INCLUDE" ]; then
+        last=$(tail -c 1 "$DNSMASQ_INCLUDE") || return 1
+        [ -z "$last" ] || printf '\n' >> "$DNSMASQ_INCLUDE" || return 1
+    fi
+    printf '%s\n' "$line" >> "$DNSMASQ_INCLUDE"
+}
+
 main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
@@ -216,23 +228,23 @@ main_firewall_base_healthy(){
 
     lan_net=$(get_lan_net)
 
-    iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp \
+    health_iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -t mangle -C FORWARD -o "$IFACE" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
-    iptables -t mangle -C FORWARD -i "$IFACE" -p tcp \
+    health_iptables -t mangle -C FORWARD -i "$IFACE" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
-    iptables -t mangle -C PREROUTING -j "$AWG_CHAIN" 2>/dev/null || return 1
-    iptables -t mangle -C "$AWG_CHAIN" -m addrtype \
+    health_iptables -t mangle -C PREROUTING -j "$AWG_CHAIN" 2>/dev/null || return 1
+    health_iptables -t mangle -C "$AWG_CHAIN" -m addrtype \
         --dst-type LOCAL -j RETURN 2>/dev/null || return 1
-    iptables -t nat -C POSTROUTING -m mark \
+    health_iptables -t nat -C POSTROUTING -m mark \
         --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     if [ -n "$lan_net" ]; then
-        iptables -t nat -C POSTROUTING -s "$lan_net" \
+        health_iptables -t nat -C POSTROUTING -s "$lan_net" \
             -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     else
-        iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
+        health_iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     fi
     ipset list "$IPSET_NAME" >/dev/null 2>&1 || return 1
     [ -f "$IPSET_MIN_COUNT_FILE" ] || return 1
@@ -256,7 +268,7 @@ main_firewall_base_healthy(){
     [ -s "$FIREWALL_EXPECTED" ] || return 1
     local actual_rules expected_rule
     actual_rules=$(managed_firewall_rules)
-    while IFS= read -r expected_rule; do
+    while IFS= read -r expected_rule || [ -n "$expected_rule" ]; do
         printf '%s\n' "$actual_rules" | grep -qFx -- "$expected_rule" || return 1
     done < "$FIREWALL_EXPECTED"
     return 0
@@ -945,7 +957,12 @@ cleanup_firewall(){
 
     # Remove dnsmasq config
     rm -f "$DNSMASQ_AWG_CONF"
-    [ -f "$DNSMASQ_INCLUDE" ] && sed -i "\|${DNSMASQ_AWG_CONF}|d" "$DNSMASQ_INCLUDE"
+    if [ -f "$DNSMASQ_INCLUDE" ] && grep -qxF "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE"; then
+        # The managed path is fixed by this add-on. Escape its literal dots.
+        local dns_path_re
+        dns_path_re=$(printf '%s' "$DNSMASQ_AWG_CONF" | sed 's/[.]/[.]/g')
+        sed -i "\|^conf-file=${dns_path_re}\$|d" "$DNSMASQ_INCLUDE" || return 1
+    fi
 
     log_msg "Firewall rules cleaned"
 }
@@ -1157,9 +1174,7 @@ setup_firewall_body(){
 
     # Add conf-file include to dnsmasq (idempotent)
     if [ $domain_count -gt 0 ]; then
-        if ! grep -qF "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE" 2>/dev/null; then
-            echo "conf-file=$DNSMASQ_AWG_CONF" >> "$DNSMASQ_INCLUDE"
-        fi
+        ensure_dns_include || return 1
     fi
 
     # --- Create custom chain in mangle table ---
@@ -1699,6 +1714,16 @@ do_stop(){
 
 # --- Install/Mount/Uninstall ---
 
+install_hook_line(){
+    local hook="$1" line="$2"
+    if [ ! -f "$hook" ]; then
+        printf '%s\n' '#!/bin/sh' > "$hook" && chmod +x "$hook" || return 1
+    fi
+    grep -q amneziawg "$hook" && return 0
+    # A user-created script may end in a comment or command without LF.
+    printf '\n%s\n' "$line" >> "$hook"
+}
+
 do_install_page(){
     nvram get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
 
@@ -1711,25 +1736,10 @@ do_install_page(){
 
     [ -f "/tmp/amneziawg_page.asp" ] && cp /tmp/amneziawg_page.asp "$ADDON_DIR/amneziawg_page.asp"
 
-    [ ! -f /jffs/scripts/service-event ] && echo "#!/bin/sh" > /jffs/scripts/service-event && chmod +x /jffs/scripts/service-event
-    if ! grep -q "amneziawg" /jffs/scripts/service-event; then
-        echo 'echo "$2" | grep -q "^awg" && /jffs/addons/amneziawg/amneziawg.sh "service_event" "$1" "$2"' >> /jffs/scripts/service-event
-    fi
-
-    # WAN event hook
-    [ ! -f /jffs/scripts/wan-event ] && echo "#!/bin/sh" > /jffs/scripts/wan-event && chmod +x /jffs/scripts/wan-event
-    if ! grep -q "amneziawg" /jffs/scripts/wan-event; then
-        echo '/jffs/addons/amneziawg/amneziawg.sh wan_event "$1" "$2"  # AmneziaWG' >> /jffs/scripts/wan-event
-    fi
-
-    # Firewall restart hook
-    [ ! -f /jffs/scripts/firewall-start ] && echo "#!/bin/sh" > /jffs/scripts/firewall-start && chmod +x /jffs/scripts/firewall-start
-    if ! grep -q "amneziawg" /jffs/scripts/firewall-start; then
-        echo '/jffs/addons/amneziawg/amneziawg.sh firewall_restart  # AmneziaWG' >> /jffs/scripts/firewall-start
-    fi
-
-    [ ! -f /jffs/scripts/services-start ] && echo "#!/bin/sh" > /jffs/scripts/services-start && chmod +x /jffs/scripts/services-start
-    grep -q "amneziawg" /jffs/scripts/services-start || echo "/jffs/addons/amneziawg/amneziawg.sh mount_ui &" >> /jffs/scripts/services-start
+    install_hook_line /jffs/scripts/service-event 'echo "$2" | grep -q "^awg" && /jffs/addons/amneziawg/amneziawg.sh "service_event" "$1" "$2"' || return 1
+    install_hook_line /jffs/scripts/wan-event '/jffs/addons/amneziawg/amneziawg.sh wan_event "$1" "$2"  # AmneziaWG' || return 1
+    install_hook_line /jffs/scripts/firewall-start '/jffs/addons/amneziawg/amneziawg.sh firewall_restart  # AmneziaWG' || return 1
+    install_hook_line /jffs/scripts/services-start '/jffs/addons/amneziawg/amneziawg.sh mount_ui &' || return 1
 
     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
 
@@ -1804,6 +1814,25 @@ do_uninstall(){
 
 # --- Watchdog (called by cron every 5 min) ---
 
+watchdog_firewall_healthy(){
+    local trace rc
+    main_firewall_healthy && return 0
+    sleep 3
+    main_firewall_healthy && return 0
+    sleep 3
+    # Keep only the last failed probe, in a private file. Never trace Apply.
+    trace=$(mktemp /tmp/awg-health.XXXXXX) || { main_firewall_healthy; return $?; }
+    (set -x; main_firewall_healthy) > "$trace" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then
+        rm -f "$trace"
+    else
+        mv -f "$trace" /tmp/awg-health-last.log &&
+            log_msg 'WATCHDOG: health trace saved: /tmp/awg-health-last.log'
+    fi
+    return "$rc"
+}
+
 do_watchdog(){
     # The dispatcher serializes watchdog with Apply, start and firewall hooks.
 
@@ -1831,7 +1860,7 @@ do_watchdog(){
     fi
 
     # Rebuild only when a core table-300/firewall component is missing.
-    if ! main_firewall_healthy; then
+    if ! watchdog_firewall_healthy; then
         log_msg "WATCHDOG: firewall or table 300 incomplete, repairing"
         do_firewall_restart
         if ! main_firewall_healthy; then
