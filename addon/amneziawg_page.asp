@@ -1316,6 +1316,7 @@ function initAutocompleteIp(){
                     <th>Auto-update Lists</th>
                     <td>
                         <label><input type="checkbox" id="geo_autoupdate"> Daily at 4:00 AM</label>
+                        <div class="hint">The LAN Russia-via-WAN policy refreshes its RU IPv4 list daily at 04:00 even when this box is off.</div>
                         &nbsp;&nbsp;
                         <input type="button" class="button_gen" id="btn_geo_update" value="Update Now" onclick="updateGeoLists();">
                     </td>

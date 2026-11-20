@@ -1,0 +1,53 @@
+name: Build and publish Merlin packages
+on:
+  push:
+    branches: [main]
+    paths: ['releases/v*.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: merlin-ipk-release
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select release
+        id: release
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^PKG_VERSION="\([^"]*\)"/\1/p' build-ipk.sh)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]
+          notes="releases/v$version.md"
+          test -s "$notes"
+          if [[ -n "$BEFORE" ]] && ! git diff --name-only --diff-filter=A "$BEFORE" HEAD -- "$notes" | grep -Fx "$notes"; then exit 0; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build ARM64 and ARMv7 packages
+        if: steps.release.outputs.version != ''
+        run: |
+          ./build.sh
+          ./build-ipk.sh
+      - name: Publish verified packages
+        if: steps.release.outputs.version != ''
+        working-directory: output
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          files=("amneziawg_${VERSION}_aarch64-3.10.ipk" "amneziawg_${VERSION}_armv7-3.2.ipk")
+          for f in "${files[@]}"; do test -s "$f"; done
+          sha256sum "${files[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          gh release create "v$VERSION" "${files[@]}" SHA256SUMS --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "AmneziaWG $VERSION" --notes-file "../releases/v$VERSION.md"

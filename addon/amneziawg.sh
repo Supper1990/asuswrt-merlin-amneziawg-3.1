@@ -57,6 +57,7 @@ log_msg(){
 
 remove_managed_cron(){
     cru d awg_geo_update 2>/dev/null
+    cru d awg_ru_update 2>/dev/null
     cru d awg_watchdog 2>/dev/null
     cru d awg_myawg_update 2>/dev/null
 
@@ -80,6 +81,8 @@ register_managed_cron(){
     fi
     if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
         cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
+    elif [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+        cru a awg_ru_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_ru"
     fi
 }
 
@@ -768,7 +771,7 @@ download_geoip_service(){
     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
         if normalize_cidrs "$tmp" "$tmp.valid" 1 &&
-           { [ "$dest" != "$GEO_DIR/ru-direct.cidr" ] || ! grep -qxF "0.0.0.0/0" "$tmp.valid"; }; then
+           { [ "$svc" != ru ] || ! grep -qxF "0.0.0.0/0" "$tmp.valid"; }; then
             mv "$tmp.valid" "$dest" || return 1
             rm -f "$tmp"
             return 0
@@ -776,6 +779,36 @@ download_geoip_service(){
         log_msg "ERROR: Invalid GeoIP response for $svc; cached list retained"
     fi
     rm -f "$tmp"
+    return 1
+}
+
+# Only the country set changes; keep the current firewall and tunnel up.
+update_ru_country(){
+    [ "$(get_setting awg_default_policy)" = vpn_non_ru ] || return 0
+    local cache="$GEO_DIR/ru-direct.cidr" stage="$GEO_DIR/.ru-direct.next"
+    local nextset=awg_ru4_next count loaded
+    mkdir -p "$GEO_DIR/geoip" || return 1
+    download_geoip_service ru "$stage" || { log_msg 'WARNING: RU update failed; previous list retained'; return 1; }
+    if ! is_running; then mv -f "$stage" "$cache"; return $?; fi
+    # All callers hold the addon dispatcher lock. A stale staging set can
+    # survive an interrupted refresh, but is never referenced by our rules.
+    ipset destroy "$nextset" 2>/dev/null || :
+    ipset create "$nextset" hash:net family inet maxelem 131072 timeout 0 || return 1
+    count=$(wc -l < "$stage")
+    if ipset_load_file "$stage" "$nextset" &&
+       loaded=$(ipset list "$nextset" -t | awk '/Number of entries:/{print $NF}') &&
+       [ "${loaded:-0}" -gt 0 ] && [ "$loaded" -eq "$count" ] &&
+       ipset swap "$nextset" awg_ru4; then
+        if mv -f "$stage" "$cache"; then
+            ipset destroy "$nextset" || return 1
+            log_msg "RU country list updated: $count IPv4 ranges"
+            return 0
+        fi
+        ipset swap "$nextset" awg_ru4 || { log_msg 'ERROR: RU cache commit and set rollback failed'; return 1; }
+    fi
+    ipset destroy "$nextset"
+    rm -f "$stage"
+    log_msg 'ERROR: RU refresh failed; previous list retained'
     return 1
 }
 
@@ -2154,6 +2187,7 @@ case "$1" in
     restart)        do_stop; wait_for_pid_exit amneziawg-go 10; do_start ;;
     status)         update_status ;;
     update_geo)     update_geo_lists && { if is_running; then setup_firewall; fi; } && update_status ;;
+    update_ru)      update_ru_country ;;
     update_ipset)   update_antifilter ;;
     check_update)   check_update ;;
     update)         do_update ;;
