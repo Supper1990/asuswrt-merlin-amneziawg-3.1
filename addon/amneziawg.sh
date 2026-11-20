@@ -160,7 +160,39 @@ get_router_ip(){
 }
 
 get_endpoint(){
-    awk -F'[ =:]+' '/^Endpoint/{print $2}' "$CONF" 2>/dev/null
+    # setconf resolves the configured hostname. Only the actual IPv4 peer
+    # belongs in IPv4 routes and rules; an IPv6 transport needs neither.
+    local peer port addr
+    peer=$("$AWG_BIN" show "$IFACE" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+    case "$peer" in *:*) ;; *) return 1;; esac
+    addr=${peer%:*}; port=${peer##*:}
+    case "$port" in ''|*[!0-9]*) return 1;; esac
+    valid_ipv4 "$addr" || return 1
+    printf '%s\n' "$addr"
+}
+
+# Do not delete an existing WAN host route owned by another service.
+clear_endpoint_route(){
+    local state="${ENDPOINT_ROUTE_STATE:-/tmp/.awg_endpoint_route}" addr gw
+    [ -f "$state" ] || return 0
+    if read -r addr gw < "$state" && valid_ipv4 "$addr" && valid_ipv4 "$gw"; then
+        ip -4 route del "$addr/32" via "$gw" 2>/dev/null || :
+    fi
+    rm -f "$state"
+}
+
+refresh_endpoint_route(){
+    local state="${ENDPOINT_ROUTE_STATE:-/tmp/.awg_endpoint_route}" addr gw tmp
+    clear_endpoint_route
+    addr=$(get_endpoint) || return 0
+    gw=$(ip -4 route show default | awk '$1=="default" && $2=="via"{print $3;exit}')
+    valid_ipv4 "$gw" || return 0
+    tmp=$(mktemp "${state}.XXXXXX") || return 1
+    if printf '%s %s\n' "$addr" "$gw" > "$tmp" && ip -4 route add "$addr/32" via "$gw" 2>/dev/null; then
+        mv -f "$tmp" "$state" && return 0
+        ip -4 route del "$addr/32" via "$gw" 2>/dev/null || :
+    fi
+    rm -f "$tmp"
 }
 
 ensure_main_routes(){
@@ -1604,11 +1636,9 @@ do_start(){
     ip link set "$IFACE" up
 
     # Routing table
-    local lan_net gw endpoint
+    local lan_net
     lan_net=$(get_lan_net)
-    gw=$(ip route | awk '/^default/{print $3; exit}')
-    endpoint=$(get_endpoint)
-    [ -n "$endpoint" ] && [ -n "$gw" ] && ip route add "$endpoint" via "$gw" 2>/dev/null
+    refresh_endpoint_route
     ensure_main_routes || return 1
 
     save_and_set_rp_filter
@@ -1683,9 +1713,7 @@ do_stop(){
     disable_aux_routing
 
     ip route flush table $RT_TABLE 2>/dev/null
-    local endpoint
-    endpoint=$(get_endpoint)
-    [ -n "$endpoint" ] && ip route del "$endpoint" 2>/dev/null
+    clear_endpoint_route
 
     restore_rp_filter
 
@@ -1914,14 +1942,7 @@ do_wan_event(){
     [ "$wan_state" != "connected" ] && return 0
     if is_running; then
         log_msg "WAN event: $wan_state on $wan_if, updating endpoint route"
-        local gw endpoint
-        gw=$(ip route | awk '/^default/{print $3; exit}')
-        endpoint=$(get_endpoint)
-        if [ -n "$endpoint" ] && [ -n "$gw" ]; then
-            ip route del "$endpoint" 2>/dev/null
-            ip route add "$endpoint" via "$gw" 2>/dev/null
-            log_msg "Endpoint route updated: $endpoint via $gw"
-        fi
+        refresh_endpoint_route
     fi
 }
 
