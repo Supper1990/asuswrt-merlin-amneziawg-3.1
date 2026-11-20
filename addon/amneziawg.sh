@@ -209,6 +209,18 @@ restore_rp_filter(){
     done
 }
 
+# Match the same complete directive as the watchdog. Preserve the last
+# user directive/comment when dnsmasq.conf.add has no terminating newline.
+ensure_dns_include(){
+    local line="conf-file=$DNSMASQ_AWG_CONF" last
+    grep -qxF "$line" "$DNSMASQ_INCLUDE" 2>/dev/null && return 0
+    if [ -s "$DNSMASQ_INCLUDE" ]; then
+        last=$(tail -c 1 "$DNSMASQ_INCLUDE") || return 1
+        [ -z "$last" ] || printf '\n' >> "$DNSMASQ_INCLUDE" || return 1
+    fi
+    printf '%s\n' "$line" >> "$DNSMASQ_INCLUDE"
+}
+
 main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
@@ -256,7 +268,7 @@ main_firewall_base_healthy(){
     [ -s "$FIREWALL_EXPECTED" ] || return 1
     local actual_rules expected_rule
     actual_rules=$(managed_firewall_rules)
-    while IFS= read -r expected_rule; do
+    while IFS= read -r expected_rule || [ -n "$expected_rule" ]; do
         printf '%s\n' "$actual_rules" | grep -qFx -- "$expected_rule" || return 1
     done < "$FIREWALL_EXPECTED"
     return 0
@@ -945,7 +957,12 @@ cleanup_firewall(){
 
     # Remove dnsmasq config
     rm -f "$DNSMASQ_AWG_CONF"
-    [ -f "$DNSMASQ_INCLUDE" ] && sed -i "\|${DNSMASQ_AWG_CONF}|d" "$DNSMASQ_INCLUDE"
+    if [ -f "$DNSMASQ_INCLUDE" ] && grep -qxF "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE"; then
+        # The managed path is fixed by this add-on. Escape its literal dots.
+        local dns_path_re
+        dns_path_re=$(printf '%s' "$DNSMASQ_AWG_CONF" | sed 's/[.]/[.]/g')
+        sed -i "\|^conf-file=${dns_path_re}\$|d" "$DNSMASQ_INCLUDE" || return 1
+    fi
 
     log_msg "Firewall rules cleaned"
 }
@@ -1157,9 +1174,7 @@ setup_firewall_body(){
 
     # Add conf-file include to dnsmasq (idempotent)
     if [ $domain_count -gt 0 ]; then
-        if ! grep -qF "conf-file=$DNSMASQ_AWG_CONF" "$DNSMASQ_INCLUDE" 2>/dev/null; then
-            echo "conf-file=$DNSMASQ_AWG_CONF" >> "$DNSMASQ_INCLUDE"
-        fi
+        ensure_dns_include || return 1
     fi
 
     # --- Create custom chain in mangle table ---
