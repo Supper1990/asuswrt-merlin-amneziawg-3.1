@@ -252,7 +252,7 @@ function doUpdate(){
 
 function loadSettings(){
     var fields = [
-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
+        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets', 'awg_country_vpn_ingress',
         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
         'awg_peer_allowedips', 'awg_peer_keepalive',
         'awg_jc', 'awg_jmin', 'awg_jmax',
@@ -302,7 +302,7 @@ function loadSettings(){
 function saveSettings(action){
     if(activeOperation || !validateClientRows()) return;
     var fields = [
-        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets',
+        'awg_privatekey', 'awg_address', 'awg_listenport', 'awg_dns', 'awg_vpn_source_nets', 'awg_country_vpn_ingress',
         'awg_peer_pubkey', 'awg_peer_psk', 'awg_peer_endpoint',
         'awg_peer_allowedips', 'awg_peer_keepalive',
         'awg_jc', 'awg_jmin', 'awg_jmax',
@@ -318,7 +318,7 @@ function saveSettings(action){
         if(el){
             var v = el.value;
             // Remove spaces from comma-separated values (Merlin truncates at spaces)
-            if(fields[i] === 'awg_peer_allowedips' || fields[i] === 'awg_address' || fields[i] === 'awg_dns'){
+            if(fields[i] === 'awg_country_vpn_ingress' || fields[i] === 'awg_peer_allowedips' || fields[i] === 'awg_address' || fields[i] === 'awg_dns'){
                 v = v.replace(/\s+/g, '');
             }
             custom_settings[fields[i]] = v;
@@ -416,7 +416,8 @@ function serializeClients(){
 function updateGeoVisibility(){
     // Show Geo settings for router-only use as well as LAN policies.
     var defPolicy = document.getElementById('default_policy').value;
-    var hasGeo = (defPolicy === 'vpn_geo' || defPolicy === 'vpn_non_ru') || document.getElementById('router_geo').checked;
+    document.getElementById('country_ingress_row').style.display = defPolicy === 'vpn_non_ru_vpn' ? '' : 'none';
+    var hasGeo = (defPolicy === 'vpn_geo' || defPolicy === 'vpn_non_ru' || defPolicy === 'vpn_non_ru_vpn') || document.getElementById('router_geo').checked;
     if(!hasGeo){
         var selects = document.querySelectorAll('.client_policy');
         for(var i = 0; i < selects.length; i++){
@@ -1209,11 +1210,18 @@ function initAutocompleteIp(){
                             <option value="direct">Direct (no VPN)</option>
                             <option value="vpn_all">VPN — All Traffic</option>
                             <option value="vpn_geo">VPN — Geo Only</option>
+                            <option value="vpn_non_ru_vpn">LAN + incoming VPN IPv4: Russia via WAN, other + selected via VPN</option>
                             <option value="vpn_non_ru">LAN IPv4: Russia via WAN, other + selected via VPN</option>
                         </select>
                         <span style="color:#666; font-size:11px; margin-left:8px;">For devices not in the list below</span>
                         <span id="awg_active_rules" style="margin-left:12px; color:#666; font-size:11px;"></span>
                     </td>
+                </tr>
+                <tr id="country_ingress_row" style="display:none">
+                    <th>Additional VPN clients</th>
+                    <td><input type="text" class="input_32_table" id="awg_country_vpn_ingress" placeholder="ipsec@10.10.10.0/24">
+                    <br>AmneziaWG (awgs+), WireGuard (wgs+) and OpenVPN (tun2+/tap2+) servers are included automatically.
+                    For IPsec enter ipsec@POOL; for another VPN enter its exact server interface@POOL. Use the actual client IPv4 subnet; separate entries with commas.</td>
                 </tr>
                 </table>
 

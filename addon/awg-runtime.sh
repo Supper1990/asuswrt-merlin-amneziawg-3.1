@@ -160,7 +160,17 @@ validate_runtime_settings(){
     v=$(get_setting awg_router_geo)
     case "$v" in ''|0|1) ;; *) log_msg 'ERROR: invalid router Geo setting'; return 1;; esac
     v=$(get_setting awg_default_policy)
-    case "$v" in ''|direct|vpn_all|vpn_geo|vpn_non_ru) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
+    case "$v" in ''|direct|vpn_all|vpn_geo|vpn_non_ru|vpn_non_ru_vpn) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
+    if [ "$v" = vpn_non_ru_vpn ]; then
+        local extras entry
+        extras=$(get_setting awg_country_vpn_ingress)
+        case "$extras" in *,) log_msg 'ERROR: empty incoming VPN selector'; return 1;; esac
+        while [ -n "$extras" ]; do
+            entry=${extras%%,*}
+            valid_country_ingress "$entry" || { log_msg 'ERROR: incoming VPN requires server-interface@IPv4/CIDR or ipsec@IPv4/CIDR'; return 1; }
+            case "$extras" in *,*) extras=${extras#*,};; *) extras=;; esac
+        done
+    fi
     v=$(get_setting awg_address)
     case "$v" in */*) ;; *) log_msg 'ERROR: IPv4 address/prefix required'; return 1;; esac
     valid_ipv4 "${v%/*}" || return 1
@@ -198,7 +208,7 @@ validate_runtime_settings(){
 
 preflight_geo(){
     local svc f custom
-    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+    if country_policy_enabled; then
         f="$GEO_DIR/ru-direct.cidr"
         normalize_cidrs "$f" "$f.checked" && ! grep -qxF '0.0.0.0/0' "$f.checked" &&
             mv "$f.checked" "$f" || { log_msg 'ERROR: invalid RU country list'; return 1; }

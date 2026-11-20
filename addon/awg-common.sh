@@ -42,3 +42,20 @@ valid_geosite_name(){
     # shell metacharacters outside the upstream character set rejected.
     printf '%s\n' "$1" | grep -qE '^[a-z0-9][a-z0-9._!-]*(@[a-z0-9!][a-z0-9._!-]*)?$'
 }
+
+country_policy_enabled(){
+    case "$(get_setting awg_default_policy)" in vpn_non_ru|vpn_non_ru_vpn) return 0;; *) return 1;; esac
+}
+
+# Optional server selectors: exact virtual interface (or inbound XFRM policy)
+# plus an explicit client pool. Never accept a raw source-only or wildcard rule.
+valid_country_ingress(){
+    local entry="$1" iface pool prefix
+    case "$entry" in *@*/*) ;; *) return 1;; esac
+    iface=${entry%%@*}; pool=${entry#*@}; prefix=${pool##*/}
+    case "$iface" in ''|*[!A-Za-z0-9_.-]*|awg0|wgc*|tun1[1-5]|tap1[1-5]) return 1;; esac
+    [ "${#iface}" -le 15 ] || return 1
+    case "$iface" in ipsec|tun*|tap*|ppp*|wg*|awgs*|tailscale*|zt*|vti*|xfrm*|ipsec*|ovpn*) ;; *) return 1;; esac
+    case "$prefix" in ''|0*|*[!0-9]*) return 1;; esac
+    [ "$prefix" -le 32 ] && valid_ipv4 "${pool%/*}"
+}

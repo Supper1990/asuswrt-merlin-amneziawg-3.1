@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 bash tests/run.sh
 
 PKG_NAME="amneziawg"
-PKG_VERSION="2.2.0-42"
+PKG_VERSION="2.2.0-43"
 
 AWG_GO_VERSION=$(sed -n 's/^ARG AWG_GO_TAG=//p' Dockerfile | head -1)
 AWG_TOOLS_VERSION=$(sed -n 's/^ARG AWG_TOOLS_TAG=//p' Dockerfile | head -1)
