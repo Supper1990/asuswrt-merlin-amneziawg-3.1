@@ -216,23 +216,23 @@ main_firewall_base_healthy(){
 
     lan_net=$(get_lan_net)
 
-    iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || return 1
-    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp \
+    health_iptables -C INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -C FORWARD -i "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -C FORWARD -o "$IFACE" -j ACCEPT 2>/dev/null || return 1
+    health_iptables -t mangle -C FORWARD -o "$IFACE" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
-    iptables -t mangle -C FORWARD -i "$IFACE" -p tcp \
+    health_iptables -t mangle -C FORWARD -i "$IFACE" -p tcp \
         --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || return 1
-    iptables -t mangle -C PREROUTING -j "$AWG_CHAIN" 2>/dev/null || return 1
-    iptables -t mangle -C "$AWG_CHAIN" -m addrtype \
+    health_iptables -t mangle -C PREROUTING -j "$AWG_CHAIN" 2>/dev/null || return 1
+    health_iptables -t mangle -C "$AWG_CHAIN" -m addrtype \
         --dst-type LOCAL -j RETURN 2>/dev/null || return 1
-    iptables -t nat -C POSTROUTING -m mark \
+    health_iptables -t nat -C POSTROUTING -m mark \
         --mark "$FWMARK"/0xffffffff -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     if [ -n "$lan_net" ]; then
-        iptables -t nat -C POSTROUTING -s "$lan_net" \
+        health_iptables -t nat -C POSTROUTING -s "$lan_net" \
             -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     else
-        iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
+        health_iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || return 1
     fi
     ipset list "$IPSET_NAME" >/dev/null 2>&1 || return 1
     [ -f "$IPSET_MIN_COUNT_FILE" ] || return 1
@@ -1804,6 +1804,25 @@ do_uninstall(){
 
 # --- Watchdog (called by cron every 5 min) ---
 
+watchdog_firewall_healthy(){
+    local trace rc
+    main_firewall_healthy && return 0
+    sleep 3
+    main_firewall_healthy && return 0
+    sleep 3
+    # Keep only the last failed probe, in a private file. Never trace Apply.
+    trace=$(mktemp /tmp/awg-health.XXXXXX) || { main_firewall_healthy; return $?; }
+    (set -x; main_firewall_healthy) > "$trace" 2>&1
+    rc=$?
+    if [ "$rc" = 0 ]; then
+        rm -f "$trace"
+    else
+        mv -f "$trace" /tmp/awg-health-last.log &&
+            log_msg 'WATCHDOG: health trace saved: /tmp/awg-health-last.log'
+    fi
+    return "$rc"
+}
+
 do_watchdog(){
     # The dispatcher serializes watchdog with Apply, start and firewall hooks.
 
@@ -1831,7 +1850,7 @@ do_watchdog(){
     fi
 
     # Rebuild only when a core table-300/firewall component is missing.
-    if ! main_firewall_healthy; then
+    if ! watchdog_firewall_healthy; then
         log_msg "WATCHDOG: firewall or table 300 incomplete, repairing"
         do_firewall_restart
         if ! main_firewall_healthy; then

@@ -37,6 +37,7 @@ chmod 755 \
     sha256sum \
         Dockerfile \
         Dockerfile.armv7 \
+        patches/amneziawg-go-ipv6-send.patch \
         output/amneziawg-go \
         output/awg \
         output/amneziawg-go-arm \

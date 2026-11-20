@@ -55,20 +55,32 @@ setup_router_geo(){
     iptables -t mangle -I OUTPUT 1 -j AWG_OUTPUT
 }
 
+# Only read probes use this helper. Avoid adding a timeout process on the
+# normal path. Old Merlin iptables supports -w but not a numeric -w argument.
+health_iptables(){
+    local rc
+    iptables "$@" && return 0
+    rc=$?
+    [ "$rc" = 4 ] || return "$rc"
+    timeout 8 iptables -w "$@"
+}
+
 router_geo_healthy(){
     local hooks port
-    hooks=$(iptables -t mangle -S OUTPUT 2>/dev/null) || return 1
+    hooks=$(health_iptables -t mangle -S OUTPUT 2>/dev/null) || return 1
     if ! router_geo_enabled; then
         printf '%s\n' "$hooks" | grep -q -- '-j AWG_OUTPUT' && return 1
-        iptables -t mangle -S AWG_OUTPUT >/dev/null 2>&1 && return 1
-        return 0
+        health_iptables -t mangle -S AWG_OUTPUT >/dev/null 2>&1 && return 1
+        # Only a missing chain is expected; lock/timeout is inconclusive.
+        [ "$?" = 1 ]
+        return $?
     fi
     [ "$(printf '%s\n' "$hooks" | grep -c '^-A OUTPUT -j AWG_OUTPUT$')" = 1 ] || return 1
     # Checking order prevents an earlier AntiFilter mark bypassing Geo policy.
     [ "$(printf '%s\n' "$hooks" | awk '/^-A /{print;exit}')" = '-A OUTPUT -j AWG_OUTPUT' ] || return 1
     port=$(router_transport_port) || return 1
-    iptables -t mangle -C AWG_OUTPUT -p udp --sport "$port" -j RETURN || return 1
-    iptables -t mangle -C AWG_OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK"
+    health_iptables -t mangle -C AWG_OUTPUT -p udp --sport "$port" -j RETURN || return 1
+    health_iptables -t mangle -C AWG_OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK"
 }
 
 prepare_memory_policy(){

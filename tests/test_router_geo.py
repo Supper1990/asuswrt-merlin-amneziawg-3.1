@@ -90,7 +90,7 @@ main_firewall_healthy
             self.assertNotIn('-I OUTPUT', r.stdout)
 
     def health_script(self):
-        return functions(RUNTIME, 'router_geo_enabled', 'router_transport_port', 'router_geo_healthy') + r'''
+        return functions(RUNTIME, 'router_geo_enabled', 'router_transport_port', 'health_iptables', 'router_geo_healthy') + r'''
 get_setting(){ echo "$ENABLED"; }
 awg_mock(){ echo "$PORT"; }
 AWG_BIN=awg_mock
@@ -129,7 +129,8 @@ iptables(){
             self.assertEqual(r.returncode == 0, chain == '0')
 
     def test_watchdog_repairs_output_without_restarting_healthy_tunnel(self):
-        script = self.health_script() + '\n' + functions(MAIN, 'do_watchdog') + r'''
+        script = self.health_script() + '\n' + functions(MAIN, 'watchdog_firewall_healthy', 'do_watchdog') + r'''
+sleep(){ :; }
 ip(){ return 0; }
 pidof(){ echo 123; }
 tunnel_healthy(){ return 0; }
