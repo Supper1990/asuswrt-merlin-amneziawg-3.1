@@ -6,18 +6,21 @@ import unittest
 from pathlib import Path
 from test_recovery import MAIN, ROOT, functions
 
+COMMON = (ROOT/'addon/awg-common.sh').read_text()
+
 class NonRu(unittest.TestCase):
-    def installed(self, count):
+    def installed(self, count, policy="vpn_non_ru", extra=""):
         with tempfile.TemporaryDirectory() as d:
             Path(d,'ru-direct.cidr').write_text('5.0.0.0/8\n')
-            script = functions(MAIN,'setup_non_ru_default','ru_country_set_healthy') + '''
+            script = COMMON + '\n' + functions(MAIN,'setup_non_ru_default','country_mark_ingress','ru_country_set_healthy') + '''
 ipset(){ case "$1" in list) echo "Number of entries: $COUNT";; esac; }
 ipset_load_file(){ :; }
 iptables(){ echo "$*"; }
-setup_non_ru_default
+get_setting(){ echo "$EXTRA"; }
+setup_non_ru_default "$POLICY"
 '''
             return subprocess.run(['sh','-c',script],text=True,capture_output=True,
-                env=dict(os.environ,GEO_DIR=d,COUNT=str(count),AWG_CHAIN='AWG',IPSET_NAME='awg_dst',FWMARK='0x100'))
+                env=dict(os.environ,GEO_DIR=d,COUNT=str(count),IFACE='awg0',POLICY=policy,EXTRA=extra,AWG_CHAIN='AWG',IPSET_NAME='awg_dst',FWMARK='0x100'))
 
     def test_incomplete_country_set_never_installs_catchall(self):
         for count in (0,2):
@@ -25,26 +28,57 @@ setup_non_ru_default
             self.assertNotEqual(result.returncode,0)
             self.assertEqual(result.stdout,'')
 
-    def test_effective_policy(self):
-        r=self.installed(1)
+    def route_fn(self, policy, extra=''):
+        r=self.installed(1, policy, extra)
         self.assertEqual(r.returncode,0,r.stderr)
         rules=[x.split()[4:] for x in r.stdout.splitlines()]
-        def route(ip, iface='br0', mark='0'):
+        def route(ip, iface='br0', mark='0', original=True, ipsec=False, src='10.77.0.9'):
             for args in rules:
-                if '-i' in args and iface==args[args.index('-i')+1]: continue
+                def arg(k): return args[args.index(k)+1]
+                if '-i' in args:
+                    f=arg('-i')
+                    if not (iface.startswith(f[:-1]) if f.endswith('+') else iface==f): continue
+                if '--pol' in args and not ipsec: continue
+                if '--ctdir' in args and not original: continue
                 if '--mark' in args and mark=='0': continue
-                if '-d' in args and ipaddress.ip_address(ip) not in ipaddress.ip_network(args[args.index('-d')+1]): continue
+                if '-d' in args and ipaddress.ip_address(ip) not in ipaddress.ip_network(arg('-d')): continue
+                if '-s' in args and ipaddress.ip_address(src) not in ipaddress.ip_network(arg('-s')): continue
                 if '--match-set' in args:
-                    name=args[args.index('--match-set')+1]
-                    if name=='awg_dst' and ip!='5.1.2.3': continue
-                    if name=='awg_ru4' and not ip.startswith('5.'): continue
+                    match = ip=='5.1.2.3' if arg('--match-set')=='awg_dst' else ip.startswith('5.')
+                    if match == ('!' in args): continue
                 if 'RETURN' in args: break
                 if 'MARK' in args: mark=args[-1]
             return mark
+        return route
+
+    def test_effective_policy(self):
+        route=self.route_fn('vpn_non_ru')
         for addr,expected in [('5.1.2.3','0x100'),('5.2.2.2','0'),('8.8.8.8','0x100'),('10.94.216.10','0')]:
             self.assertEqual(route(addr),expected)
-        self.assertEqual(route('8.8.8.8','awg0'),'0')
+        for iface in ('awgs0','wgs1','tun21','ppp0','awg0'):
+            self.assertEqual(route('8.8.8.8',iface),'0')
         self.assertEqual(route('8.8.8.8',mark='0x101'),'0x101')
+
+    def test_vpn_ingress_scope_and_precedence(self):
+        route=self.route_fn('vpn_non_ru_vpn','ipsec@10.77.0.0/24,tailscale0@100.64.1.0/24')
+        for iface in ('awgs0','wgs1','tun21','tap22'):
+            for ip,expected in [('5.1.2.3','0x100'),('5.2.2.2','0'),('8.8.8.8','0x100'),('10.94.216.10','0')]:
+                self.assertEqual(route(ip,iface),expected)
+            self.assertEqual(route('8.8.8.8',iface,mark='0x101'),'0x101')
+            self.assertEqual(route('8.8.8.8',iface,original=False),'0')
+        for iface in ('eth0','wgc1','tun11','ppp0','awg0','tailscale0'):
+            self.assertEqual(route('8.8.8.8',iface),'0')
+        self.assertEqual(route('8.8.8.8','eth0',ipsec=True),'0x100')
+        self.assertEqual(route('8.8.8.8','eth0',ipsec=True,src='10.88.0.1'),'0')
+        self.assertEqual(route('8.8.8.8','awg0',ipsec=True),'0')
+        self.assertEqual(route('8.8.8.8','tailscale0',src='100.64.1.5'),'0x100')
+
+    def test_refuses_unsafe_extra_selectors(self):
+        for value in ['+@10.0.0.0/8','awg0@10.0.0.0/8','eth0@10.0.0.0/8',
+                      'ipsec','ipsec@0.0.0.0/0','ppp+@10.0.0.0/8','tun11@10.0.0.0/8',
+                      'ipsec@10.0.0.999/24','wgc1@1.2.3.4/32']:
+            r=self.installed(1,'vpn_non_ru_vpn',value)
+            self.assertNotEqual(r.returncode,0,value)
 
     def test_invalid_country_cache_refused_before_apply(self):
         common=(ROOT/'addon/awg-common.sh').read_text()
@@ -62,7 +96,7 @@ preflight_geo
                 self.assertEqual(r.returncode==0,ok)
 
     def test_cron_runs_one_daily_job_for_country_mode(self):
-        script = functions(MAIN, 'register_managed_cron') + '''
+        script = COMMON + '\n' + functions(MAIN, 'register_managed_cron') + '''
 remove_managed_cron(){ :; }
 antifilter_enabled(){ return 1; }
 cru(){ echo "$*"; }
@@ -70,6 +104,7 @@ get_setting(){ case "$1" in awg_geo_autoupdate) echo "$AUTO";; awg_default_polic
 register_managed_cron
 '''
         for policy, auto, job in [('vpn_non_ru','0','update_ru'), ('vpn_non_ru','1','update_geo'),
+                                  ('vpn_non_ru_vpn','0','update_ru'), ('vpn_non_ru_vpn','1','update_geo'),
                                   ('vpn_geo','0',None), ('vpn_geo','1','update_geo')]:
             result = subprocess.check_output(['sh','-c',script], text=True,
                      env=dict(os.environ,POLICY=policy,AUTO=auto))

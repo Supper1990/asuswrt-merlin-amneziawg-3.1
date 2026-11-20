@@ -81,7 +81,7 @@ register_managed_cron(){
     fi
     if [ "$(get_setting awg_geo_autoupdate)" = "1" ]; then
         cru a awg_geo_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_geo"
-    elif [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+    elif country_policy_enabled; then
         cru a awg_ru_update "0 4 * * * '$ADDON_DIR/amneziawg.sh' update_ru"
     fi
 }
@@ -260,7 +260,7 @@ main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
     router_geo_healthy || return 1
-    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then ru_country_set_healthy || return 1; fi
+    if country_policy_enabled; then ru_country_set_healthy || return 1; fi
 
     lan_net=$(get_lan_net)
 
@@ -784,7 +784,7 @@ download_geoip_service(){
 
 # Only the country set changes; keep the current firewall and tunnel up.
 update_ru_country(){
-    [ "$(get_setting awg_default_policy)" = vpn_non_ru ] || return 0
+    country_policy_enabled || return 0
     local cache="$GEO_DIR/ru-direct.cidr" stage="$GEO_DIR/.ru-direct.next"
     local nextset=awg_ru4_next count loaded
     mkdir -p "$GEO_DIR/geoip" || return 1
@@ -821,7 +821,7 @@ download_all_geo(){
     local selected_services
     selected_services=$(selected_geoip_services)
     local count=0 total=0 ok=0 geo_failed=0
-    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+    if country_policy_enabled; then
         download_geoip_service ru "$GEO_DIR/ru-direct.cidr" || geo_failed=1
     fi
     for svc in $selected_services; do
@@ -1106,22 +1106,39 @@ extract_geosite_category(){
     ' "$source" > "$output"
 }
 
-# This default applies only after per-device policies. Restrict it to LAN
-# ingress: replies from the tunnel must never be marked back into it.
+# These rules run after the per-device policies; no global catch-all.
+country_mark_ingress(){
+    iptables -t mangle -A "$AWG_CHAIN" "$@" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+    iptables -t mangle -A "$AWG_CHAIN" "$@" -m set ! --match-set awg_ru4 dst -j MARK --set-mark "$FWMARK"
+}
 setup_non_ru_default(){
-    local net
+    local net iface entry pool extras
     ipset create awg_ru4 hash:net family inet maxelem 131072 timeout 0 || return 1
     ipset_load_file "$GEO_DIR/ru-direct.cidr" awg_ru4 || return 1
     ru_country_set_healthy || return 1
-    iptables -t mangle -A "$AWG_CHAIN" ! -i br0 -j RETURN || return 1
+    iptables -t mangle -A "$AWG_CHAIN" -i "$IFACE" -j RETURN || return 1
     iptables -t mangle -A "$AWG_CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN || return 1
     for net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
         iptables -t mangle -A "$AWG_CHAIN" -d "$net" -j RETURN || return 1
     done
-    iptables -t mangle -A "$AWG_CHAIN" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
-    # RETURN keeps an explicit VPN mark, or lets normal WAN/AntiFilter decide.
-    iptables -t mangle -A "$AWG_CHAIN" -m set --match-set awg_ru4 dst -j RETURN || return 1
-    iptables -t mangle -A "$AWG_CHAIN" -j MARK --set-mark "$FWMARK"
+    country_mark_ingress -i br0 || return 1
+    [ "$1" = vpn_non_ru_vpn ] || return 0
+    for iface in awgs+ wgs+ tun2+ tap2+; do
+        country_mark_ingress -i "$iface" -m conntrack --ctdir ORIGINAL || return 1
+    done
+    extras=$(get_setting awg_country_vpn_ingress)
+    while [ -n "$extras" ]; do
+        entry=${extras%%,*}
+        case "$extras" in *,*) extras=${extras#*,};; *) extras=;; esac
+        valid_country_ingress "$entry" || return 1
+        iface=${entry%%@*}; pool=${entry#*@}
+        if [ "$iface" = ipsec ]; then
+            country_mark_ingress -s "$pool" -m policy --dir in --pol ipsec -m conntrack --ctdir ORIGINAL || return 1
+        else
+            country_mark_ingress -i "$iface" -s "$pool" -m conntrack --ctdir ORIGINAL || return 1
+        fi
+    done
+    return 0
 }
 
 ru_country_set_healthy(){
@@ -1361,9 +1378,9 @@ setup_firewall_body(){
 
     # --- Default policy (last rules in chain) ---
     case "$default_policy" in
-        vpn_non_ru)
-            setup_non_ru_default || return 1
-            log_msg "Default LAN IPv4: RU -> normal WAN; selected and non-RU -> VPN"
+        vpn_non_ru|vpn_non_ru_vpn)
+            setup_non_ru_default "$default_policy" || return 1
+            log_msg "Default $default_policy IPv4: RU -> normal WAN; selected and non-RU -> VPN"
             ;;
         vpn_all)
             iptables -t mangle -A "$AWG_CHAIN" -j MARK --set-mark "$FWMARK"
@@ -1454,7 +1471,7 @@ update_geo_if_needed(){
     mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains"
     selected_services=$(selected_geoip_services)
 
-    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ] && [ ! -s "$GEO_DIR/ru-direct.cidr" ]; then
+    if country_policy_enabled && [ ! -s "$GEO_DIR/ru-direct.cidr" ]; then
         download_geoip_service ru "$GEO_DIR/ru-direct.cidr" || { log_msg "ERROR: RU country list unavailable"; return 1; }
     fi
 
