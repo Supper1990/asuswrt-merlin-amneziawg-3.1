@@ -416,7 +416,7 @@ function serializeClients(){
 function updateGeoVisibility(){
     // Show Geo settings for router-only use as well as LAN policies.
     var defPolicy = document.getElementById('default_policy').value;
-    var hasGeo = (defPolicy === 'vpn_geo') || document.getElementById('router_geo').checked;
+    var hasGeo = (defPolicy === 'vpn_geo' || defPolicy === 'vpn_non_ru') || document.getElementById('router_geo').checked;
     if(!hasGeo){
         var selects = document.querySelectorAll('.client_policy');
         for(var i = 0; i < selects.length; i++){
@@ -1209,6 +1209,7 @@ function initAutocompleteIp(){
                             <option value="direct">Direct (no VPN)</option>
                             <option value="vpn_all">VPN — All Traffic</option>
                             <option value="vpn_geo">VPN — Geo Only</option>
+                            <option value="vpn_non_ru">LAN IPv4: Russia via WAN, other + selected via VPN</option>
                         </select>
                         <span style="color:#666; font-size:11px; margin-left:8px;">For devices not in the list below</span>
                         <span id="awg_active_rules" style="margin-left:12px; color:#666; font-size:11px;"></span>
@@ -1315,6 +1316,7 @@ function initAutocompleteIp(){
                     <th>Auto-update Lists</th>
                     <td>
                         <label><input type="checkbox" id="geo_autoupdate"> Daily at 4:00 AM</label>
+                        <div class="hint">The LAN Russia-via-WAN policy refreshes its RU IPv4 list daily at 04:00 even when this box is off.</div>
                         &nbsp;&nbsp;
                         <input type="button" class="button_gen" id="btn_geo_update" value="Update Now" onclick="updateGeoLists();">
                     </td>

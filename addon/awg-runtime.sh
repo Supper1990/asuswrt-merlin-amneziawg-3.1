@@ -160,7 +160,7 @@ validate_runtime_settings(){
     v=$(get_setting awg_router_geo)
     case "$v" in ''|0|1) ;; *) log_msg 'ERROR: invalid router Geo setting'; return 1;; esac
     v=$(get_setting awg_default_policy)
-    case "$v" in ''|direct|vpn_all|vpn_geo) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
+    case "$v" in ''|direct|vpn_all|vpn_geo|vpn_non_ru) ;; *) log_msg 'ERROR: invalid default policy'; return 1;; esac
     v=$(get_setting awg_address)
     case "$v" in */*) ;; *) log_msg 'ERROR: IPv4 address/prefix required'; return 1;; esac
     valid_ipv4 "${v%/*}" || return 1
@@ -198,6 +198,11 @@ validate_runtime_settings(){
 
 preflight_geo(){
     local svc f custom
+    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+        f="$GEO_DIR/ru-direct.cidr"
+        normalize_cidrs "$f" "$f.checked" && ! grep -qxF '0.0.0.0/0' "$f.checked" &&
+            mv "$f.checked" "$f" || { log_msg 'ERROR: invalid RU country list'; return 1; }
+    fi
     for svc in $(selected_geoip_services); do
         f="$GEO_DIR/geoip/v2fly_${svc}.cidr"
         [ -s "$f" ] || { log_msg "ERROR: missing GeoIP list $svc"; return 1; }
@@ -343,6 +348,9 @@ setup_firewall(){
     # The shared direct rule is retained by cleanup and must not be replayed
     # from this snapshot, which could duplicate zapret's concurrent rule.
     ip rule show | awk '$0 ~ /lookup 300/ {print}' > "$txn/rules"
+    if ipset list awg_ru4 -t >/dev/null 2>&1; then
+        ipset save awg_ru4 > "$txn/ru-set" || { rm -rf "$txn"; return 1; }
+    fi
     if ipset list "$IPSET_NAME" -t >/dev/null 2>&1; then
         ipset save "$IPSET_NAME" > "$txn/ipset" || { rm -rf "$txn"; return 1; }
         had_set=1
@@ -375,6 +383,7 @@ setup_firewall(){
         log_msg 'ERROR: apply failed; restoring previous runtime'
         cleanup_firewall
         if [ "$had_set" = 1 ]; then ipset restore -exist < "$txn/ipset" || rc=2; fi
+        if [ -s "$txn/ru-set" ]; then ipset restore -exist < "$txn/ru-set" || rc=2; fi
         restore_owned_rules "$txn/firewall" || rc=2
         ip route flush table "$RT_TABLE"
         while IFS= read -r line; do [ -z "$line" ] || ip route replace table "$RT_TABLE" $line || rc=2; done < "$txn/routes"
