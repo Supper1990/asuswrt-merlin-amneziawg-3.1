@@ -257,6 +257,7 @@ main_firewall_base_healthy(){
     local lan_net min_ipset_count current_ipset_count
 
     router_geo_healthy || return 1
+    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then ru_country_set_healthy || return 1; fi
 
     lan_net=$(get_lan_net)
 
@@ -763,10 +764,12 @@ download_geoip_service(){
     local svc="$1"
     svc=$(echo "$svc" | tr -d ' ' | tr 'A-Z' 'a-z')
     valid_geo_service_name "$svc" || return 1
+    local dest="${2:-$GEO_DIR/geoip/v2fly_${svc}.cidr}"
     local tmp="$GEO_DIR/geoip/.dl_${svc}.tmp"
     if curl -sfL --connect-timeout 10 --max-time 30 "${V2FLY_GEOIP_BASE}/${svc}.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-        if normalize_cidrs "$tmp" "$tmp.valid" 1; then
-            mv "$tmp.valid" "$GEO_DIR/geoip/v2fly_${svc}.cidr" || return 1
+        if normalize_cidrs "$tmp" "$tmp.valid" 1 &&
+           { [ "$dest" != "$GEO_DIR/ru-direct.cidr" ] || ! grep -qxF "0.0.0.0/0" "$tmp.valid"; }; then
+            mv "$tmp.valid" "$dest" || return 1
             rm -f "$tmp"
             return 0
         fi
@@ -785,6 +788,9 @@ download_all_geo(){
     local selected_services
     selected_services=$(selected_geoip_services)
     local count=0 total=0 ok=0 geo_failed=0
+    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ]; then
+        download_geoip_service ru "$GEO_DIR/ru-direct.cidr" || geo_failed=1
+    fi
     for svc in $selected_services; do
         total=$((total + 1))
     done
@@ -982,6 +988,10 @@ cleanup_firewall(){
         iptables -D FORWARD -i br0 -d "$doh_ip" -p udp --dport 443 -j REJECT 2>/dev/null
     done
 
+    if ipset list awg_ru4 -t >/dev/null 2>&1; then
+        ipset destroy awg_ru4 || return 1
+    fi
+
     # Destroy ipset
     ipset flush "$IPSET_NAME" 2>/dev/null
     ipset destroy "$IPSET_NAME" 2>/dev/null
@@ -1061,6 +1071,31 @@ extract_geosite_category(){
             if (unresolved_include) exit 3
         }
     ' "$source" > "$output"
+}
+
+# This default applies only after per-device policies. Restrict it to LAN
+# ingress: replies from the tunnel must never be marked back into it.
+setup_non_ru_default(){
+    local net
+    ipset create awg_ru4 hash:net family inet maxelem 131072 timeout 0 || return 1
+    ipset_load_file "$GEO_DIR/ru-direct.cidr" awg_ru4 || return 1
+    ru_country_set_healthy || return 1
+    iptables -t mangle -A "$AWG_CHAIN" ! -i br0 -j RETURN || return 1
+    iptables -t mangle -A "$AWG_CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN || return 1
+    for net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$AWG_CHAIN" -d "$net" -j RETURN || return 1
+    done
+    iptables -t mangle -A "$AWG_CHAIN" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+    # RETURN keeps an explicit VPN mark, or lets normal WAN/AntiFilter decide.
+    iptables -t mangle -A "$AWG_CHAIN" -m set --match-set awg_ru4 dst -j RETURN || return 1
+    iptables -t mangle -A "$AWG_CHAIN" -j MARK --set-mark "$FWMARK"
+}
+
+ru_country_set_healthy(){
+    local expected actual
+    expected=$(wc -l < "$GEO_DIR/ru-direct.cidr") || return 1
+    actual=$(ipset list awg_ru4 -t | awk '/Number of entries:/{print $NF}')
+    [ "${actual:-0}" -gt 0 ] && [ "$actual" -eq "$expected" ]
 }
 
 setup_firewall_body(){
@@ -1293,6 +1328,10 @@ setup_firewall_body(){
 
     # --- Default policy (last rules in chain) ---
     case "$default_policy" in
+        vpn_non_ru)
+            setup_non_ru_default || return 1
+            log_msg "Default LAN IPv4: RU -> normal WAN; selected and non-RU -> VPN"
+            ;;
         vpn_all)
             iptables -t mangle -A "$AWG_CHAIN" -j MARK --set-mark "$FWMARK"
             log_msg "Default: all -> VPN"
@@ -1381,6 +1420,10 @@ update_geo_if_needed(){
     local svc selected_services
     mkdir -p "$GEO_DIR/geoip" "$GEO_DIR/domains"
     selected_services=$(selected_geoip_services)
+
+    if [ "$(get_setting awg_default_policy)" = vpn_non_ru ] && [ ! -s "$GEO_DIR/ru-direct.cidr" ]; then
+        download_geoip_service ru "$GEO_DIR/ru-direct.cidr" || { log_msg "ERROR: RU country list unavailable"; return 1; }
+    fi
 
     # Apply must be sufficient when a category is deselected.  Prune before
     # downloading missing selections and before setup_firewall runs.
