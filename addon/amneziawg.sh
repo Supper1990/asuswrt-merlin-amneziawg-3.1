@@ -1699,6 +1699,16 @@ do_stop(){
 
 # --- Install/Mount/Uninstall ---
 
+install_hook_line(){
+    local hook="$1" line="$2"
+    if [ ! -f "$hook" ]; then
+        printf '%s\n' '#!/bin/sh' > "$hook" && chmod +x "$hook" || return 1
+    fi
+    grep -q amneziawg "$hook" && return 0
+    # A user-created script may end in a comment or command without LF.
+    printf '\n%s\n' "$line" >> "$hook"
+}
+
 do_install_page(){
     nvram get rc_support | grep -q am_addons || { log_msg "ERROR: Addons not supported"; return 1; }
 
@@ -1711,25 +1721,10 @@ do_install_page(){
 
     [ -f "/tmp/amneziawg_page.asp" ] && cp /tmp/amneziawg_page.asp "$ADDON_DIR/amneziawg_page.asp"
 
-    [ ! -f /jffs/scripts/service-event ] && echo "#!/bin/sh" > /jffs/scripts/service-event && chmod +x /jffs/scripts/service-event
-    if ! grep -q "amneziawg" /jffs/scripts/service-event; then
-        echo 'echo "$2" | grep -q "^awg" && /jffs/addons/amneziawg/amneziawg.sh "service_event" "$1" "$2"' >> /jffs/scripts/service-event
-    fi
-
-    # WAN event hook
-    [ ! -f /jffs/scripts/wan-event ] && echo "#!/bin/sh" > /jffs/scripts/wan-event && chmod +x /jffs/scripts/wan-event
-    if ! grep -q "amneziawg" /jffs/scripts/wan-event; then
-        echo '/jffs/addons/amneziawg/amneziawg.sh wan_event "$1" "$2"  # AmneziaWG' >> /jffs/scripts/wan-event
-    fi
-
-    # Firewall restart hook
-    [ ! -f /jffs/scripts/firewall-start ] && echo "#!/bin/sh" > /jffs/scripts/firewall-start && chmod +x /jffs/scripts/firewall-start
-    if ! grep -q "amneziawg" /jffs/scripts/firewall-start; then
-        echo '/jffs/addons/amneziawg/amneziawg.sh firewall_restart  # AmneziaWG' >> /jffs/scripts/firewall-start
-    fi
-
-    [ ! -f /jffs/scripts/services-start ] && echo "#!/bin/sh" > /jffs/scripts/services-start && chmod +x /jffs/scripts/services-start
-    grep -q "amneziawg" /jffs/scripts/services-start || echo "/jffs/addons/amneziawg/amneziawg.sh mount_ui &" >> /jffs/scripts/services-start
+    install_hook_line /jffs/scripts/service-event 'echo "$2" | grep -q "^awg" && /jffs/addons/amneziawg/amneziawg.sh "service_event" "$1" "$2"' || return 1
+    install_hook_line /jffs/scripts/wan-event '/jffs/addons/amneziawg/amneziawg.sh wan_event "$1" "$2"  # AmneziaWG' || return 1
+    install_hook_line /jffs/scripts/firewall-start '/jffs/addons/amneziawg/amneziawg.sh firewall_restart  # AmneziaWG' || return 1
+    install_hook_line /jffs/scripts/services-start '/jffs/addons/amneziawg/amneziawg.sh mount_ui &' || return 1
 
     [ -f "$GEO_DIR/v2fly_categories.txt" ] && cp "$GEO_DIR/v2fly_categories.txt" /www/user/v2fly_categories.htm 2>/dev/null
 
