@@ -312,9 +312,9 @@ main_firewall_base_healthy(){
 
 managed_firewall_rules(){
     iptables-save -t mangle 2>/dev/null | grep "^-A $AWG_CHAIN "
-    iptables-save -t mangle 2>/dev/null | awk '$1=="-A" && ($2=="AWG_OUTPUT" || ($2=="OUTPUT" && /-j AWG_OUTPUT$/))'
+    iptables-save -t mangle 2>/dev/null | awk -v compat="${AWGSM_COUNTRY_COMPAT:-0}" '$1=="-A" && ((compat==1 && $2=="AWGSM_CM43") || $2=="AWG_OUTPUT" || ($2=="OUTPUT" && /-j AWG_OUTPUT$/))'
     iptables-save -t nat 2>/dev/null | awk '/^-A PREROUTING / && /-i br0 / && /--dport 53 / && /-j DNAT/'
-    iptables-save -t filter 2>/dev/null | awk '/^-A FORWARD / && /-i br0 / && /--dport (443|853) / && /-j REJECT/'
+    iptables-save -t filter 2>/dev/null | awk -v compat="${AWGSM_COUNTRY_COMPAT:-0}" '(compat==1 && $1=="-A" && $2=="AWGSM_CF43") || /^-A FORWARD / && /-i br0 / && /--dport (443|853) / && /-j REJECT/'
 }
 
 # Wait for process to exit. Usage: wait_for_pid_exit <name> <timeout>
@@ -986,7 +986,53 @@ cleanup_ipv6_block(){
     ip6tables -D FORWARD -i "$IFACE" -o br0 -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null
 }
 
+# The compatible server owns the per-peer callers. Never hook awgs0 globally.
+awgsm_country_contract(){
+    [ -r "$1" ] && awk '
+        /#[[:space:]]*AWGSM_COUNTRY43:/ {marker=1}
+        /AWGSM_CM43/ {m=1}
+        /AWGSM_CF43/ {f=1}
+        END {exit !(marker && m && f)}
+    ' "$1"
+}
+
+AWGSM_COUNTRY_COMPAT=0
+if awgsm_country_contract /jffs/addons/awgs-manager/manager.py; then
+    AWGSM_COUNTRY_COMPAT=1
+fi
+
+setup_awgsm_country(){
+    local net
+    # Mirror the addon's exclusions in the narrowly delegated FORWARD permission.
+    iptables -t filter -A AWGSM_CF43 -m addrtype --dst-type LOCAL -j RETURN || return 1
+    for net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t filter -A AWGSM_CF43 -d "$net" -j RETURN || return 1
+    done
+    iptables -t filter -A AWGSM_CF43 -i awgs0 -o "$IFACE" -m conntrack --ctdir ORIGINAL -m mark --mark "$FWMARK/0xffffffff" -m set ! --match-set awg_ru4 dst -j ACCEPT || return 1
+    iptables -t mangle -A AWGSM_CM43 -i awgs0 -m conntrack --ctdir ORIGINAL -m mark --mark 0/0xffffffff -j "$AWG_CHAIN" || return 1
+}
+
+reset_awgsm_country(){
+    local spec table chain
+    for spec in filter:AWGSM_CF43 mangle:AWGSM_CM43; do
+        table=${spec%:*}; chain=${spec#*:}
+        if [ "${AWGSM_COUNTRY_COMPAT:-0}" = 1 ]; then
+            # The server may start later. Preserve both chains and their callers.
+            iptables -t "$table" -S "$chain" >/dev/null 2>&1 ||
+                iptables -t "$table" -N "$chain" ||
+                iptables -t "$table" -S "$chain" >/dev/null || return 1
+        else
+            # Also detach our recorded rules if the manager has been removed.
+            [ -s "$FIREWALL_EXPECTED" ] && grep -q "^-A $chain " "$FIREWALL_EXPECTED" || continue
+            iptables -t "$table" -S "$chain" >/dev/null 2>&1 || continue
+        fi
+        iptables -t "$table" -F "$chain" || return 1
+    done
+    return 0
+}
+
 cleanup_firewall(){
+    reset_awgsm_country || return 1
     cleanup_router_geo || return 1
     # Unhook from PREROUTING, flush and delete custom chain
     iptables -t mangle -D PREROUTING -j "$AWG_CHAIN" 2>/dev/null
@@ -1451,6 +1497,9 @@ setup_firewall_body(){
     [ -n "$source_addr" ] && ip rule add from "$source_addr" lookup $RT_TABLE prio 100
     register_managed_cron
 
+    if [ "${AWGSM_COUNTRY_COMPAT:-0}" = 1 ] && [ "$default_policy" = vpn_non_ru_vpn ]; then
+        setup_awgsm_country || return 1
+    fi
     managed_firewall_rules > "$FIREWALL_EXPECTED"
     ip_count=$(ipset list "$IPSET_NAME" -t | awk '/Number of entries/{print $NF}')
     domain_count=$(awk -F/ '/^ipset=/{for(i=2;i<NF;i++)print $i}' "$DNSMASQ_AWG_CONF" | sort -u | wc -l)
