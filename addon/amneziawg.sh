@@ -1112,25 +1112,39 @@ country_mark_ingress(){
     iptables -t mangle -A "$AWG_CHAIN" "$@" -m set ! --match-set awg_ru4 dst -j MARK --set-mark "$FWMARK"
 }
 setup_non_ru_default(){
-    local net iface entry pool extras
+    local net iface entry pool extras scan
     ipset create awg_ru4 hash:net family inet maxelem 131072 timeout 0 || return 1
     ipset_load_file "$GEO_DIR/ru-direct.cidr" awg_ru4 || return 1
     ru_country_set_healthy || return 1
     iptables -t mangle -A "$AWG_CHAIN" -i "$IFACE" -j RETURN || return 1
-    iptables -t mangle -A "$AWG_CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN || return 1
     for net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
         iptables -t mangle -A "$AWG_CHAIN" -d "$net" -j RETURN || return 1
     done
+    # Merlin can deliver decrypted IPsec packets with precisely this packet mark.
+    # Only classify original packets from opted-in pools, for VPN destinations.
+    extras=
+    if [ "$1" = vpn_non_ru_vpn ]; then
+        extras=$(get_setting awg_country_vpn_ingress)
+        scan=$extras
+        while [ -n "$scan" ]; do
+            entry=${scan%%,*}
+            case "$scan" in *,*) scan=${scan#*,};; *) scan=;; esac
+            valid_country_ingress "$entry" || return 1
+            case "$entry" in ipsec@*)
+                country_mark_ingress -s "${entry#*@}" -m policy --dir in --pol ipsec \
+                    -m conntrack --ctdir ORIGINAL -m mark --mark 0x08000000/0xffffffff || return 1
+            ;; esac
+        done
+    fi
+    iptables -t mangle -A "$AWG_CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN || return 1
     country_mark_ingress -i br0 || return 1
     [ "$1" = vpn_non_ru_vpn ] || return 0
     for iface in awgs+ wgs+ tun2+ tap2+; do
         country_mark_ingress -i "$iface" -m conntrack --ctdir ORIGINAL || return 1
     done
-    extras=$(get_setting awg_country_vpn_ingress)
     while [ -n "$extras" ]; do
         entry=${extras%%,*}
         case "$extras" in *,*) extras=${extras#*,};; *) extras=;; esac
-        valid_country_ingress "$entry" || return 1
         iface=${entry%%@*}; pool=${entry#*@}
         if [ "$iface" = ipsec ]; then
             country_mark_ingress -s "$pool" -m policy --dir in --pol ipsec -m conntrack --ctdir ORIGINAL || return 1

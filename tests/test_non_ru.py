@@ -40,7 +40,11 @@ setup_non_ru_default "$POLICY"
                     if not (iface.startswith(f[:-1]) if f.endswith('+') else iface==f): continue
                 if '--pol' in args and not ipsec: continue
                 if '--ctdir' in args and not original: continue
-                if '--mark' in args and mark=='0': continue
+                if '--mark' in args:
+                    at=args.index('--mark')
+                    value,mask=arg('--mark').split('/')
+                    match=int(mark,0) & int(mask,0) == int(value,0)
+                    if match == (args[at-1]=='!'): continue
                 if '-d' in args and ipaddress.ip_address(ip) not in ipaddress.ip_network(arg('-d')): continue
                 if '-s' in args and ipaddress.ip_address(src) not in ipaddress.ip_network(arg('-s')): continue
                 if '--match-set' in args:
@@ -79,6 +83,19 @@ setup_non_ru_default "$POLICY"
                       'ipsec@10.0.0.999/24','wgc1@1.2.3.4/32']:
             r=self.installed(1,'vpn_non_ru_vpn',value)
             self.assertNotEqual(r.returncode,0,value)
+
+    def test_ipsec_firmware_mark(self):
+        flag='0x08000000'
+        pool='ipsec@10.77.0.0/24'
+        route=self.route_fn('vpn_non_ru_vpn',pool)
+        for addr,want in [('8.8.8.8','0x100'),('5.1.2.3','0x100'),('5.2.2.2',flag),('10.0.1.1',flag)]:
+            self.assertEqual(route(addr,'eth0',mark=flag,ipsec=True),want)
+        for kw in [dict(ipsec=False),dict(original=False),dict(src='10.88.0.1')]:
+            self.assertEqual(route('8.8.8.8','eth0',mark=flag,**dict({'ipsec':True},**kw)),flag)
+        for mark in ['0x101','0x08000101','0x66']:
+            self.assertEqual(route('8.8.8.8','eth0',mark=mark,ipsec=True),mark)
+        for policy,extra in [('vpn_non_ru',pool),('vpn_non_ru_vpn','')]:
+            self.assertEqual(self.route_fn(policy,extra)('8.8.8.8','eth0',mark=flag,ipsec=True),flag)
 
     def test_invalid_country_cache_refused_before_apply(self):
         common=(ROOT/'addon/awg-common.sh').read_text()
