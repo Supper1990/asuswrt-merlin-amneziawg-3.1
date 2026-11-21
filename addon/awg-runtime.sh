@@ -723,16 +723,17 @@ restore_owned_rules(){
             if [ "$table" = mangle ] && grep -q '^:AWG_OUTPUT ' "$snapshot"; then
                 printf ':AWG_OUTPUT - [0:0]\n'
             fi
-            awk -v wanted="$table" '
+            awk -v wanted="$table" -v compat="${AWGSM_COUNTRY_COMPAT:-0}" '
                 /^\*/{table=substr($0,2);delete index_by_chain;next}
                 table!=wanted{next}
                 /^-A /{
                     chain=$2; index_by_chain[chain]++
                     own=(wanted=="mangle" && ($2=="AWG" || $2=="AWG_OUTPUT" || ($2=="OUTPUT" && /-j AWG_OUTPUT$/) || ($2=="PREROUTING" && /-j AWG$/))) ||
+                        (compat==1 && ((wanted=="mangle" && $2=="AWGSM_CM43") || (wanted=="filter" && $2=="AWGSM_CF43"))) ||
                         (wanted=="nat" && $2=="PREROUTING" && /-i br0 / && /--dport 53 / && /-j DNAT/) ||
                         (wanted=="filter" && $2=="FORWARD" && /-i br0 / && /--dport (443|853) / && /-j REJECT/)
                     if(own){
-                        if(chain=="AWG" || chain=="AWG_OUTPUT")print
+                        if(chain=="AWG" || chain=="AWG_OUTPUT" || chain=="AWGSM_CM43" || chain=="AWGSM_CF43")print
                         else {sub(/^-A [^ ]+ /, "");print "-I " chain " " index_by_chain[chain] " " $0}
                     }
                 }' "$snapshot"

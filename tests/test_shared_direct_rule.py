@@ -100,7 +100,7 @@ log_msg(){ echo "$*"; }
 
     def test_cleanup_retains_shared_rule_and_removes_awg_rules(self):
         with tempfile.TemporaryDirectory() as d:
-            body = functions(MAIN, 'cleanup_firewall') + r'''
+            body = functions(MAIN, 'reset_awgsm_country', 'cleanup_firewall') + r'''
 cleanup_router_geo(){ :; }
 iptables(){ :; }
 ipset(){ :; }
